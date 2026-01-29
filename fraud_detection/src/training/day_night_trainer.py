@@ -1,36 +1,36 @@
 """
-Training System with Day/Night Cycle and RLHF
-Architecture: Day (Inference) → Night (Training) → Morning (Validation)
+Enhanced Training System for Fraud Detection
+Inspired by Day/Night/Morning Cycle - Simplified for Kaggle
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch_geometric.loader import DataLoader as PyGDataLoader
-from trl import PPOTrainer, PPOConfig
-from transformers import TrainingArguments
-from typing import Dict, List, Optional
-import wandb
-from datetime import datetime, time
-import schedule
+from torch_geometric.loader import DataLoader
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, 
+    f1_score, roc_auc_score, confusion_matrix,
+    precision_recall_curve
+)
+from datetime import datetime
 import json
 import os
-from tqdm import tqdm
-import numpy as np
-
-from ..models.hybrid_model import GNNLLMHybrid, RewardModel
-from ..utils.metrics import compute_all_metrics
-from ..utils.memory import TemporalMemory
+from typing import Dict, List, Optional
+import warnings
+warnings.filterwarnings('ignore')
 
 
-class DayNightTrainer:
+class FraudDetectionTrainer:
     """
-    Trainer avec cycle Jour/Nuit/Matin
+    Trainer simplifié pour Kaggle avec concepts Day/Night/Morning
     """
+    
     def __init__(
         self,
-        model: GNNLLMHybrid,
+        model: nn.Module,
         config: Dict,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
@@ -38,505 +38,471 @@ class DayNightTrainer:
         self.config = config
         self.device = device
         
-        # Mémoire temporelle pour stocker les cas critiques
-        self.memory = TemporalMemory(
-            max_size=config["memory"]["max_memory_size"],
-            retention_days=config["memory"]["retention_days"]
-        )
+        # Mémoire pour cas critiques (inspiré du mode Day)
+        self.critical_cases = []
         
-        # Reward model pour RLHF
-        self.reward_model = RewardModel(
-            hidden_size=config["llm"]["hidden_size"] if "hidden_size" in config["llm"] else 768
-        ).to(device)
-        
-        # Optimizers
-        self.gnn_optimizer = optim.AdamW(
-            self.model.gnn.parameters(),
-            lr=config["fine_tuning"]["learning_rate"]
-        )
-        
-        self.llm_optimizer = optim.AdamW(
-            self.model.llm.parameters(),
-            lr=config["rlhf"]["learning_rate"]
-        )
-        
-        # Loss functions
-        self.classification_loss = nn.CrossEntropyLoss()
-        
-        # Metrics tracking
-        self.metrics_history = {
-            "train": [],
-            "val": [],
-            "test": []
+        # Historique d'entraînement
+        self.history = {
+            'train': [],
+            'val': [],
+            'learning_rates': [],
+            'critical_cases_count': []
         }
         
-        # État du système
-        self.current_mode = "day"  # day, night, morning
-        self.pending_approval = False
+        # Meilleurs résultats
+        self.best_val_loss = float('inf')
+        self.best_val_f1 = 0.0
+        self.best_epoch = 0
         
-        # Logging
-        if config["monitoring"]["enable_wandb"]:
-            wandb.init(
-                project="fraud-detection-gnn-llm",
-                name=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                config=config
+        # Setup optimizer et loss
+        self._setup_optimizer()
+        self._setup_loss()
+        self._setup_scheduler()
+        
+        print(f"✅ Trainer initialisé sur {device}")
+    
+    def _setup_optimizer(self):
+        """Configure l'optimizer avec learning rates différentiels"""
+        # Séparer les paramètres
+        param_groups = [
+            {
+                'params': self.model.gnn.parameters(),
+                'lr': self.config['gnn_lr'],
+                'name': 'gnn'
+            },
+            {
+                'params': self.model.llm.parameters(),
+                'lr': self.config['llm_lr'],
+                'name': 'llm'
+            },
+            {
+                'params': list(self.model.fusion.parameters()) + 
+                         list(self.model.classifier.parameters()),
+                'lr': self.config['classifier_lr'],
+                'name': 'classifier'
+            }
+        ]
+        
+        self.optimizer = optim.AdamW(
+            param_groups,
+            betas=self.config.get('adam_betas', (0.9, 0.999)),
+            eps=self.config.get('adam_eps', 1e-8),
+            weight_decay=self.config.get('weight_decay', 1e-5)
+        )
+        
+        print(f"⚙️ Optimizer configuré:")
+        print(f"   GNN LR: {self.config['gnn_lr']}")
+        print(f"   LLM LR: {self.config['llm_lr']}")
+        print(f"   Classifier LR: {self.config['classifier_lr']}")
+    
+    def _setup_loss(self):
+        """Configure la fonction de loss"""
+        if self.config.get('use_focal_loss', True):
+            self.criterion = FocalLoss(
+                alpha=self.config.get('focal_alpha', 0.25),
+                gamma=self.config.get('focal_gamma', 2.0),
+                pos_weight=torch.tensor([self.config.get('pos_weight', 10.0)]).to(self.device)
             )
+            print(f"🎯 Loss: Focal Loss (α={self.config.get('focal_alpha', 0.25)}, "
+                  f"γ={self.config.get('focal_gamma', 2.0)})")
+        else:
+            pos_weight = torch.tensor([self.config.get('pos_weight', 10.0)]).to(self.device)
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            print(f"🎯 Loss: BCEWithLogitsLoss (pos_weight={self.config.get('pos_weight', 10.0)})")
     
-    def day_mode_inference(
-        self,
-        data_loader: DataLoader,
-        save_critical: bool = True
-    ) -> Dict:
-        """
-        Mode JOUR: Inférence en temps réel avec sauvegarde des cas critiques
-        
-        Args:
-            data_loader: DataLoader pour les nouvelles transactions
-            save_critical: Sauvegarder les cas critiques
-        
-        Returns:
-            Résultats d'inférence et métriques
-        """
-        print("\n☀️ MODE JOUR - Inférence en temps réel")
-        print("=" * 50)
-        
-        self.model.eval()
-        self.current_mode = "day"
-        
-        results = []
-        critical_cases = []
-        human_verifications_needed = []
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(data_loader, desc="Inférence")):
-                batch = batch.to(self.device)
-                
-                # Prédiction
-                logits, features = self.model(
-                    batch.x,
-                    batch.edge_index,
-                    batch.batch
-                )
-                
-                probs = torch.softmax(logits, dim=-1)
-                predictions = torch.argmax(probs, dim=-1)
-                confidences = torch.max(probs, dim=-1)[0]
-                
-                # Traiter chaque transaction
-                for i in range(len(predictions)):
-                    pred = predictions[i].item()
-                    conf = confidences[i].item()
-                    fraud_prob = probs[i, 1].item()
-                    
-                    result = {
-                        "prediction": pred,
-                        "confidence": conf,
-                        "fraud_probability": fraud_prob,
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    
-                    # Cas critique: faible confiance ou haute probabilité de fraude
-                    is_critical = (
-                        conf < 0.6 or
-                        (pred == 1 and fraud_prob > 0.8)
-                    )
-                    
-                    if is_critical:
-                        critical_cases.append({
-                            "features": batch.x[i].cpu().numpy(),
-                            "prediction": pred,
-                            "confidence": conf,
-                            "fraud_prob": fraud_prob
-                        })
-                    
-                    # Vérification humaine nécessaire
-                    threshold = self.config["day_night_cycle"]["day"]["human_verification_threshold"]
-                    if pred == 1 and fraud_prob > threshold:
-                        human_verifications_needed.append(result)
-                        result["action"] = "BLOCKED - Awaiting human verification"
-                    elif pred == 1:
-                        result["action"] = "FLAGGED - Monitoring"
-                    else:
-                        result["action"] = "APPROVED"
-                    
-                    results.append(result)
-        
-        # Sauvegarder les cas critiques dans la mémoire
-        if save_critical and critical_cases:
-            self.memory.add_batch(critical_cases, label="critical_day")
-            print(f"💾 {len(critical_cases)} cas critiques sauvegardés")
-        
-        # Statistiques
-        stats = {
-            "total_transactions": len(results),
-            "fraud_detected": sum(1 for r in results if r["prediction"] == 1),
-            "human_verification_needed": len(human_verifications_needed),
-            "critical_cases": len(critical_cases),
-            "avg_confidence": np.mean([r["confidence"] for r in results])
-        }
-        
-        print(f"\n📊 Statistiques du jour:")
-        print(f"  - Transactions: {stats['total_transactions']}")
-        print(f"  - Fraudes détectées: {stats['fraud_detected']}")
-        print(f"  - Vérifications humaines: {stats['human_verification_needed']}")
-        print(f"  - Cas critiques: {stats['critical_cases']}")
-        print(f"  - Confiance moyenne: {stats['avg_confidence']:.2%}")
-        
-        return {
-            "results": results,
-            "stats": stats,
-            "critical_cases": critical_cases,
-            "human_verifications": human_verifications_needed
-        }
+    def _setup_scheduler(self):
+        """Configure le learning rate scheduler"""
+        if self.config.get('use_scheduler', True):
+            self.scheduler = WarmupReduceLROnPlateau(
+                self.optimizer,
+                warmup_epochs=self.config.get('warmup_epochs', 2),
+                patience=self.config.get('lr_patience', 3),
+                factor=self.config.get('lr_factor', 0.5),
+                min_lr=self.config.get('min_lr', 1e-6)
+            )
+            print(f"📉 Scheduler: Warm-up + ReduceLROnPlateau")
+        else:
+            self.scheduler = None
     
-    def night_mode_training(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        num_epochs: int = 3
-    ) -> Dict:
-        """
-        Mode NUIT: Fine-tuning + RLHF sur les données du jour
-        
-        Args:
-            train_loader: DataLoader d'entraînement
-            val_loader: DataLoader de validation
-            num_epochs: Nombre d'epochs
-        
-        Returns:
-            Métriques d'entraînement
-        """
-        print("\n🌙 MODE NUIT - Fine-tuning & RLHF")
-        print("=" * 50)
-        
-        self.model.train()
-        self.current_mode = "night"
-        
-        # Charger les cas critiques de la mémoire
-        critical_memory = self.memory.get_recent(days=1, label="critical_day")
-        feedback_memory = self.memory.get_recent(days=1, label="human_feedback")
-        
-        print(f"📚 Mémoire chargée:")
-        print(f"  - Cas critiques: {len(critical_memory)}")
-        print(f"  - Feedbacks humains: {len(feedback_memory)}")
-        
-        # Phase 1: Fine-tuning GNN
-        print("\n🔧 Phase 1: Fine-tuning GNN")
-        gnn_metrics = self._finetune_gnn(train_loader, val_loader, num_epochs)
-        
-        # Phase 2: RLHF sur LLM
-        print("\n🎯 Phase 2: RLHF sur LLM")
-        rlhf_metrics = self._rlhf_training(feedback_memory)
-        
-        # Validation finale
-        print("\n✅ Validation finale")
-        val_metrics = self.evaluate(val_loader, split="val")
-        
-        # Sauvegarder le checkpoint
-        checkpoint_path = self._save_checkpoint("night_training")
-        
-        return {
-            "gnn_metrics": gnn_metrics,
-            "rlhf_metrics": rlhf_metrics,
-            "val_metrics": val_metrics,
-            "checkpoint": checkpoint_path
-        }
-    
-    def _finetune_gnn(
+    def train(
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
         num_epochs: int
-    ) -> Dict:
-        """Fine-tuning du GNN"""
-        
-        best_val_loss = float('inf')
-        metrics = []
+    ):
+        """
+        Boucle d'entraînement principale
+        """
+        print("\n" + "="*80)
+        print("🚀 DÉBUT DE L'ENTRAÎNEMENT")
+        print("="*80)
         
         for epoch in range(num_epochs):
-            epoch_loss = 0
-            epoch_metrics = {"epoch": epoch + 1}
+            print(f"\n{'='*80}")
+            print(f"📅 Epoch {epoch + 1}/{num_epochs}")
+            print(f"{'='*80}")
             
-            # Training
-            self.model.train()
-            train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-            
-            for batch in train_bar:
-                batch = batch.to(self.device)
-                
-                # Forward
-                logits, _ = self.model(batch.x, batch.edge_index, batch.batch)
-                loss = self.classification_loss(logits, batch.y)
-                
-                # Backward
-                self.gnn_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.gnn.parameters(), 1.0)
-                self.gnn_optimizer.step()
-                
-                epoch_loss += loss.item()
-                train_bar.set_postfix({"loss": loss.item()})
-            
-            avg_loss = epoch_loss / len(train_loader)
-            epoch_metrics["train_loss"] = avg_loss
+            # Entraînement
+            train_metrics = self._train_epoch(train_loader, epoch + 1)
             
             # Validation
-            val_metrics = self.evaluate(val_loader, split="val")
-            epoch_metrics.update(val_metrics)
+            val_metrics = self._validate(val_loader, epoch + 1)
+            
+            # Sauvegarder l'historique
+            self.history['train'].append(train_metrics)
+            self.history['val'].append(val_metrics)
+            
+            # Learning rates
+            lrs = {f"lr_{group['name']}": group['lr'] 
+                   for group in self.optimizer.param_groups}
+            self.history['learning_rates'].append(lrs)
+            self.history['critical_cases_count'].append(len(self.critical_cases))
+            
+            # Afficher les résultats
+            self._print_epoch_results(epoch + 1, train_metrics, val_metrics)
+            
+            # Scheduler step
+            if self.scheduler:
+                self.scheduler.step(val_metrics['loss'])
             
             # Sauvegarder le meilleur modèle
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                self._save_checkpoint("best_gnn")
+            self._save_best_model(epoch + 1, train_metrics, val_metrics)
             
-            metrics.append(epoch_metrics)
-            
-            # Logging
-            if self.config["monitoring"]["enable_wandb"]:
-                wandb.log(epoch_metrics)
-            
-            print(f"Epoch {epoch+1}: train_loss={avg_loss:.4f}, "
-                  f"val_loss={val_metrics['loss']:.4f}, "
-                  f"val_f1={val_metrics['f1_score']:.4f}")
+            # Early stopping
+            if self._check_early_stopping(val_metrics['loss'], epoch + 1):
+                print(f"\n⚠️ Early stopping à l'epoch {epoch + 1}")
+                break
         
-        return {"epochs": metrics, "best_val_loss": best_val_loss}
+        print("\n" + "="*80)
+        print("✅ ENTRAÎNEMENT TERMINÉ!")
+        print("="*80)
+        self._print_final_results()
     
-    def _rlhf_training(self, feedback_data: List[Dict]) -> Dict:
-        """
-        RLHF training avec PPO
-        
-        Args:
-            feedback_data: Données de feedback humain
-        
-        Returns:
-            Métriques RLHF
-        """
-        if not feedback_data:
-            print("⚠️ Pas de feedback humain disponible, RLHF sauté")
-            return {"status": "skipped", "reason": "no_feedback"}
-        
-        print(f"🎓 RLHF avec {len(feedback_data)} feedbacks")
-        
-        # Configuration PPO
-        ppo_config = PPOConfig(
-            model_name=self.config["llm"]["model_name"],
-            learning_rate=self.config["rlhf"]["learning_rate"],
-            batch_size=16,
-            mini_batch_size=4,
-            ppo_epochs=self.config["rlhf"]["ppo_epochs"]
-        )
-        
-        # TODO: Implémenter le pipeline RLHF complet avec PPOTrainer
-        # Pour l'instant, simulation
-        
-        rlhf_metrics = {
-            "status": "completed",
-            "feedback_used": len(feedback_data),
-            "avg_reward": np.random.uniform(0.6, 0.9)  # Placeholder
-        }
-        
-        return rlhf_metrics
-    
-    def morning_validation(
-        self,
-        val_loader: DataLoader,
-        test_loader: Optional[DataLoader] = None
-    ) -> Dict:
-        """
-        Mode MATIN: Validation et décision de déploiement
-        
-        Args:
-            val_loader: DataLoader de validation
-            test_loader: DataLoader de test (optionnel)
-        
-        Returns:
-            Résultats de validation et recommandation de déploiement
-        """
-        print("\n🌅 MODE MATIN - Validation & Déploiement")
-        print("=" * 50)
-        
-        self.current_mode = "morning"
-        
-        # Charger le meilleur checkpoint de la nuit
-        self._load_checkpoint("best_gnn")
-        
-        # Validation complète
-        val_metrics = self.evaluate(val_loader, split="val")
-        
-        test_metrics = None
-        if test_loader:
-            test_metrics = self.evaluate(test_loader, split="test")
-        
-        # Critères de déploiement
-        deploy_criteria = {
-            "min_f1": 0.75,
-            "min_precision": 0.70,
-            "min_recall": 0.70,
-            "max_false_positive_rate": 0.10
-        }
-        
-        # Vérifier les critères
-        can_deploy = (
-            val_metrics["f1_score"] >= deploy_criteria["min_f1"] and
-            val_metrics["precision"] >= deploy_criteria["min_precision"] and
-            val_metrics["recall"] >= deploy_criteria["min_recall"] and
-            val_metrics.get("false_positive_rate", 1.0) <= deploy_criteria["max_false_positive_rate"]
-        )
-        
-        recommendation = {
-            "can_deploy": can_deploy,
-            "val_metrics": val_metrics,
-            "test_metrics": test_metrics,
-            "criteria": deploy_criteria,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        if can_deploy:
-            print("✅ Modèle prêt pour le déploiement")
-            self.pending_approval = True
-        else:
-            print("❌ Modèle ne remplit pas les critères")
-            print("Métriques actuelles vs requises:")
-            print(f"  F1: {val_metrics['f1_score']:.4f} vs {deploy_criteria['min_f1']}")
-            print(f"  Precision: {val_metrics['precision']:.4f} vs {deploy_criteria['min_precision']}")
-            print(f"  Recall: {val_metrics['recall']:.4f} vs {deploy_criteria['min_recall']}")
-        
-        # Sauvegarder le rapport
-        self._save_validation_report(recommendation)
-        
-        return recommendation
-    
-    def evaluate(self, data_loader: DataLoader, split: str = "val") -> Dict:
-        """
-        Évaluer le modèle
-        
-        Args:
-            data_loader: DataLoader à évaluer
-            split: train/val/test
-        
-        Returns:
-            Dictionnaire de métriques
-        """
-        self.model.eval()
-        
+    def _train_epoch(self, loader: DataLoader, epoch: int) -> Dict:
+        """Une epoch d'entraînement"""
+        self.model.train()
+        total_loss = 0
         all_preds = []
         all_labels = []
-        all_probs = []
-        total_loss = 0
         
-        with torch.no_grad():
-            for batch in tqdm(data_loader, desc=f"Eval {split}"):
-                batch = batch.to(self.device)
-                
-                logits, _ = self.model(batch.x, batch.edge_index, batch.batch)
-                loss = self.classification_loss(logits, batch.y)
-                
-                probs = torch.softmax(logits, dim=-1)
-                preds = torch.argmax(probs, dim=-1)
-                
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(batch.y.cpu().numpy())
-                all_probs.extend(probs[:, 1].cpu().numpy())
-                total_loss += loss.item()
+        progress_bar = tqdm(loader, desc=f"Training", leave=False)
         
-        # Calculer toutes les métriques
-        metrics = compute_all_metrics(
-            y_true=np.array(all_labels),
-            y_pred=np.array(all_preds),
-            y_prob=np.array(all_probs)
-        )
+        for data in progress_bar:
+            data = data.to(self.device)
+            
+            # Forward
+            logits = self.model(data).squeeze()
+            if logits.dim() == 0:
+                logits = logits.unsqueeze(0)
+            
+            labels = data.y.float()
+            loss = self.criterion(logits, labels)
+            
+            # Backward
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping
+            if self.config.get('grad_clip', 1.0) > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config['grad_clip']
+                )
+            
+            self.optimizer.step()
+            
+            # Métriques
+            total_loss += loss.item()
+            preds = torch.sigmoid(logits).detach().cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+            
+            # Détecter cas critiques
+            self._detect_critical_cases(data, preds, labels)
+            
+            progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
         
-        metrics["loss"] = total_loss / len(data_loader)
-        
-        # Logging
-        if self.config["monitoring"]["enable_wandb"]:
-            wandb.log({f"{split}_{k}": v for k, v in metrics.items()})
+        metrics = compute_metrics(np.array(all_preds), np.array(all_labels))
+        metrics['loss'] = total_loss / len(loader)
         
         return metrics
     
-    def _save_checkpoint(self, name: str) -> str:
-        """Sauvegarder un checkpoint"""
-        checkpoint_dir = self.config["paths"]["checkpoints_dir"]
-        os.makedirs(checkpoint_dir, exist_ok=True)
+    def _validate(self, loader: DataLoader, epoch: int) -> Dict:
+        """Validation"""
+        self.model.eval()
+        total_loss = 0
+        all_preds = []
+        all_labels = []
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint_path = f"{checkpoint_dir}/{name}_{timestamp}.pt"
+        with torch.no_grad():
+            for data in tqdm(loader, desc=f"Validation", leave=False):
+                data = data.to(self.device)
+                
+                logits = self.model(data).squeeze()
+                if logits.dim() == 0:
+                    logits = logits.unsqueeze(0)
+                
+                labels = data.y.float()
+                loss = self.criterion(logits, labels)
+                
+                total_loss += loss.item()
+                preds = torch.sigmoid(logits).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(labels.cpu().numpy())
         
-        torch.save({
-            "model_state_dict": self.model.state_dict(),
-            "gnn_optimizer_state_dict": self.gnn_optimizer.state_dict(),
-            "llm_optimizer_state_dict": self.llm_optimizer.state_dict(),
-            "config": self.config,
-            "timestamp": timestamp
-        }, checkpoint_path)
+        metrics = compute_metrics(np.array(all_preds), np.array(all_labels))
+        metrics['loss'] = total_loss / len(loader)
         
-        print(f"💾 Checkpoint sauvegardé: {checkpoint_path}")
-        
-        return checkpoint_path
+        return metrics
     
-    def _load_checkpoint(self, name: str):
-        """Charger un checkpoint"""
-        checkpoint_dir = self.config["paths"]["checkpoints_dir"]
-        
-        # Trouver le checkpoint le plus récent avec ce nom
-        checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith(name)]
-        if not checkpoints:
-            print(f"⚠️ Pas de checkpoint trouvé: {name}")
+    def _detect_critical_cases(self, data, preds, labels):
+        """Détecter et sauvegarder les cas critiques"""
+        if not self.config.get('save_critical_cases', True):
             return
         
-        latest_checkpoint = sorted(checkpoints)[-1]
-        checkpoint_path = f"{checkpoint_dir}/{latest_checkpoint}"
+        threshold = self.config.get('critical_confidence_threshold', 0.6)
+        max_cases = self.config.get('max_critical_cases', 1000)
         
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        
-        print(f"📂 Checkpoint chargé: {checkpoint_path}")
+        for i in range(len(preds)):
+            conf = max(preds[i], 1 - preds[i])
+            if conf < threshold and len(self.critical_cases) < max_cases:
+                self.critical_cases.append({
+                    'prediction': int(preds[i] > 0.5),
+                    'confidence': float(conf),
+                    'fraud_prob': float(preds[i]),
+                    'true_label': int(labels[i].item())
+                })
     
-    def _save_validation_report(self, recommendation: Dict):
-        """Sauvegarder le rapport de validation"""
-        reports_dir = f"{self.config['paths']['logs_dir']}/validation_reports"
-        os.makedirs(reports_dir, exist_ok=True)
+    def _print_epoch_results(self, epoch: int, train_metrics: Dict, val_metrics: Dict):
+        """Afficher les résultats de l'epoch"""
+        print(f"\n📊 Résultats Epoch {epoch}:")
+        print(f"   Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = f"{reports_dir}/validation_{timestamp}.json"
+        print(f"\n   Métriques Train:")
+        print(f"      Accuracy:  {train_metrics['accuracy']:.4f}")
+        print(f"      Precision: {train_metrics['precision']:.4f}")
+        print(f"      Recall:    {train_metrics['recall']:.4f}")
+        print(f"      F1:        {train_metrics['f1']:.4f}")
+        print(f"      AUC:       {train_metrics['auc']:.4f}")
         
-        with open(report_path, 'w') as f:
-            json.dump(recommendation, f, indent=2)
+        print(f"\n   Métriques Val:")
+        print(f"      Accuracy:  {val_metrics['accuracy']:.4f}")
+        print(f"      Precision: {val_metrics['precision']:.4f}")
+        print(f"      Recall:    {val_metrics['recall']:.4f}")
+        print(f"      F1:        {val_metrics['f1']:.4f}")
+        print(f"      AUC:       {val_metrics['auc']:.4f}")
         
-        print(f"📄 Rapport sauvegardé: {report_path}")
+        # Vérifier critères de déploiement
+        can_deploy, _ = check_deployment_criteria(val_metrics, self.config)
+        if can_deploy:
+            print(f"\n   ✅ Modèle prêt pour le déploiement!")
+        else:
+            print(f"\n   ⚠️ Critères de déploiement non atteints")
+    
+    def _save_best_model(self, epoch: int, train_metrics: Dict, val_metrics: Dict):
+        """Sauvegarder le meilleur modèle"""
+        if val_metrics['loss'] < self.best_val_loss:
+            self.best_val_loss = val_metrics['loss']
+            self.best_val_f1 = val_metrics['f1']
+            self.best_epoch = epoch
+            
+            checkpoint_path = os.path.join(
+                self.config['checkpoint_dir'], 
+                "best_model.pt"
+            )
+            
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'train_metrics': train_metrics,
+                'val_metrics': val_metrics,
+                'config': self.config
+            }, checkpoint_path)
+            
+            print(f"\n💾 Meilleur modèle sauvegardé! (Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f})")
+    
+    def _check_early_stopping(self, val_loss: float, epoch: int) -> bool:
+        """Vérifier early stopping"""
+        if not hasattr(self, 'early_stopping_counter'):
+            self.early_stopping_counter = 0
+            self.early_stopping_best = val_loss
+        
+        patience = self.config.get('patience', 5)
+        min_delta = self.config.get('min_delta', 1e-4)
+        
+        if val_loss < self.early_stopping_best - min_delta:
+            self.early_stopping_best = val_loss
+            self.early_stopping_counter = 0
+            return False
+        else:
+            self.early_stopping_counter += 1
+            return self.early_stopping_counter >= patience
+    
+    def _print_final_results(self):
+        """Afficher les résultats finaux"""
+        print(f"\n🏆 Meilleure performance:")
+        print(f"   Epoch: {self.best_epoch}")
+        print(f"   Val Loss: {self.best_val_loss:.4f}")
+        print(f"   Val F1: {self.best_val_f1:.4f}")
+        
+        if self.critical_cases:
+            print(f"\n🔍 Cas critiques détectés: {len(self.critical_cases)}")
+    
+    def plot_results(self, save_path: str):
+        """Créer les visualisations"""
+        fig = plt.figure(figsize=(20, 12))
+        gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
+        
+        epochs_range = range(1, len(self.history['train']) + 1)
+        
+        # Loss
+        ax1 = fig.add_subplot(gs[0, 0:2])
+        ax1.plot(epochs_range, [m['loss'] for m in self.history['train']], 'o-', label='Train')
+        ax1.plot(epochs_range, [m['loss'] for m in self.history['val']], 's-', label='Val')
+        ax1.axvline(x=self.best_epoch, color='r', linestyle='--', alpha=0.5)
+        ax1.set_title('Loss Evolution', fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # F1 Score
+        ax2 = fig.add_subplot(gs[0, 2:4])
+        ax2.plot(epochs_range, [m['f1'] for m in self.history['train']], 'o-', label='Train')
+        ax2.plot(epochs_range, [m['f1'] for m in self.history['val']], 's-', label='Val')
+        ax2.axhline(y=self.config.get('deploy_min_f1', 0.75), color='g', linestyle='--', alpha=0.5)
+        ax2.set_title('F1 Score', fontweight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Autres métriques...
+        metrics_to_plot = [
+            ('precision', gs[1, 0]),
+            ('recall', gs[1, 1]),
+            ('accuracy', gs[1, 2]),
+            ('auc', gs[1, 3])
+        ]
+        
+        for metric_name, position in metrics_to_plot:
+            ax = fig.add_subplot(position)
+            ax.plot(epochs_range, [m[metric_name] for m in self.history['train']], 'o-', label='Train')
+            ax.plot(epochs_range, [m[metric_name] for m in self.history['val']], 's-', label='Val')
+            ax.set_title(metric_name.capitalize(), fontweight='bold')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # Learning rates
+        ax7 = fig.add_subplot(gs[2, 0:2])
+        for lr_name in self.history['learning_rates'][0].keys():
+            lrs = [lr_dict[lr_name] for lr_dict in self.history['learning_rates']]
+            ax7.plot(epochs_range, lrs, 'o-', label=lr_name)
+        ax7.set_title('Learning Rate Schedule', fontweight='bold')
+        ax7.set_yscale('log')
+        ax7.legend()
+        ax7.grid(True, alpha=0.3)
+        
+        # Critical cases
+        ax8 = fig.add_subplot(gs[2, 2:4])
+        ax8.plot(epochs_range, self.history['critical_cases_count'], 'ro-')
+        ax8.set_title('Critical Cases Accumulated', fontweight='bold')
+        ax8.grid(True, alpha=0.3)
+        
+        plt.suptitle(f'Training Results - Best: Epoch {self.best_epoch}, Loss {self.best_val_loss:.4f}, F1 {self.best_val_f1:.4f}',
+                     fontsize=16, fontweight='bold')
+        
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"📊 Graphiques sauvegardés: {save_path}")
 
 
-def schedule_day_night_cycle(trainer: DayNightTrainer, config: Dict):
-    """
-    Programmer le cycle jour/nuit/matin
+# ============================================
+# FONCTIONS UTILITAIRES
+# ============================================
+
+class FocalLoss(nn.Module):
+    """Focal Loss pour déséquilibre de classes"""
+    def __init__(self, alpha=0.25, gamma=2.0, pos_weight=None):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.pos_weight = pos_weight
+        
+    def forward(self, inputs, targets):
+        bce_loss = nn.functional.binary_cross_entropy_with_logits(
+            inputs, targets, 
+            pos_weight=self.pos_weight,
+            reduction='none'
+        )
+        
+        probs = torch.sigmoid(inputs)
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        focal_weight = (1 - pt) ** self.gamma
+        
+        if self.alpha is not None:
+            alpha_t = torch.where(targets == 1, self.alpha, 1 - self.alpha)
+            focal_weight = alpha_t * focal_weight
+        
+        return (focal_weight * bce_loss).mean()
+
+
+class WarmupReduceLROnPlateau:
+    """Learning rate scheduler avec warm-up"""
+    def __init__(self, optimizer, warmup_epochs, patience, factor, min_lr):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.current_epoch = 0
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+        
+        self.plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=factor, 
+            patience=patience, min_lr=min_lr, verbose=True
+        )
     
-    Args:
-        trainer: Instance du trainer
-        config: Configuration
-    """
-    print("🕐 Configuration du cycle jour/nuit/matin...")
+    def step(self, val_loss=None):
+        self.current_epoch += 1
+        
+        if self.current_epoch <= self.warmup_epochs:
+            warmup_factor = self.current_epoch / self.warmup_epochs
+            for i, group in enumerate(self.optimizer.param_groups):
+                group['lr'] = self.base_lrs[i] * warmup_factor
+            print(f"   🔥 Warm-up: epoch {self.current_epoch}/{self.warmup_epochs}")
+        else:
+            if val_loss is not None:
+                self.plateau_scheduler.step(val_loss)
+
+
+def compute_metrics(predictions, labels, threshold=0.5):
+    """Calculer toutes les métriques"""
+    preds_binary = (predictions > threshold).astype(int)
     
-    # Mode jour: 8h-20h
-    schedule.every().day.at("08:00").do(
-        lambda: print("☀️ Passage en mode JOUR")
-    )
+    metrics = {
+        'accuracy': accuracy_score(labels, preds_binary),
+        'precision': precision_score(labels, preds_binary, zero_division=0),
+        'recall': recall_score(labels, preds_binary, zero_division=0),
+        'f1': f1_score(labels, preds_binary, zero_division=0),
+        'auc': roc_auc_score(labels, predictions) if len(np.unique(labels)) > 1 else 0.0
+    }
     
-    # Mode nuit: 20h-8h
-    schedule.every().day.at("20:00").do(
-        lambda: print("🌙 Passage en mode NUIT")
-    )
+    # Matrice de confusion
+    cm = confusion_matrix(labels, preds_binary)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        metrics['fpr'] = fp / (fp + tn) if (fp + tn) > 0 else 0
+        metrics['fnr'] = fn / (fn + tp) if (fn + tp) > 0 else 0
     
-    # Validation matin: 7h
-    schedule.every().day.at("07:00").do(
-        lambda: print("🌅 Validation matinale")
-    )
+    return metrics
+
+
+def check_deployment_criteria(metrics: Dict, config: Dict):
+    """Vérifier si le modèle peut être déployé"""
+    criteria = {
+        'f1': metrics.get('f1', 0) >= config.get('deploy_min_f1', 0.75),
+        'precision': metrics.get('precision', 0) >= config.get('deploy_min_precision', 0.70),
+        'recall': metrics.get('recall', 0) >= config.get('deploy_min_recall', 0.70),
+        'fpr': metrics.get('fpr', 1.0) <= config.get('deploy_max_fpr', 0.10)
+    }
     
-    print("✓ Cycle programmé")
-    print("  - 08:00-20:00: Mode JOUR (inférence)")
-    print("  - 20:00-08:00: Mode NUIT (training)")
-    print("  - 07:00: Validation matinale")
+    return all(criteria.values()), criteria
 
 
 if __name__ == "__main__":
-    print("Testing Day/Night Training System...")
-    print("✓ System ready!")
+    print("✅ Trainer module loaded successfully!")
