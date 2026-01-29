@@ -1,263 +1,256 @@
-"""
-Modèle hybride GNN + LLM pour la détection de fraude
-Combine les embeddings du GNN avec un LLM (DistilGPT2/Phi-2) pour l'analyse contextuelle
-"""
-
+import sys
+import os
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
+from torch_geometric.data import Data, Batch
 
-from .gnn_model import GNNModel
+# Configuration des chemins
+sys.path.insert(0, '/kaggle/working/fraud_detection_project/fraud_detection')
+os.chdir('/kaggle/working/fraud_detection_project/fraud_detection')
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🖥️  Device: {device}")
 
-class HybridFraudDetector(nn.Module):
-    """
-    Détecteur de fraude hybride combinant :
-    - GNN (GAT) pour l'analyse structurelle du graphe de transactions
-    - LLM (DistilGPT2/Phi-2 + LoRA) pour l'analyse contextuelle et le raisonnement
-    """
+# ============================================
+# CRÉATION DU MODÈLE HYBRIDE COMPLET
+# ============================================
+
+print("\n" + "="*60)
+print("🧠 CRÉATION DU MODÈLE HYBRIDE GNN + DistilGPT2")
+print("="*60)
+
+# 1. GNN (Graph Neural Network)
+print("\n1️⃣ Création du GNN...")
+from src.models.gnn_model import GNNModel
+
+# Configuration complète du GNN avec input_dim
+gnn_config = {
+    'input_dim': 64,          # IMPORTANT: Dimension des features d'entrée
+    'hidden_channels': 128,
+    'num_layers': 2,
+    'dropout': 0.3,
+    'heads': 4
+}
+
+# Créer le GNN et s'assurer qu'il est sur le bon device
+gnn = GNNModel(gnn_config)
+gnn = gnn.to(device)
+
+# Force tous les paramètres sur le device
+for param in gnn.parameters():
+    param.data = param.data.to(device)
     
-    def __init__(self, config, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        super(HybridFraudDetector, self).__init__()
-        
-        self.config = config
-        self.device = device
-        
-        # 1. Composant GNN
-        print("🔧 Initialisation du GNN (GAT)...")
-        self.gnn = GNNModel(config.get('gnn', {}))
-        
-        # 2. Composant LLM avec détection automatique
-        llm_config = config.get('llm', {})
-        model_name = llm_config.get('model_name', 'distilgpt2')  # Par défaut DistilGPT2
-        
-        print(f"🔧 Chargement du LLM ({model_name})...")
-        
-        # Déterminer si trust_remote_code est nécessaire
-        trust_remote_code = 'phi' in model_name.lower()
-        
-        # Tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-            padding_side='left'
-        )
-        
-        # Ajouter un pad_token si manquant
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Charger le modèle de base
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-            torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
-            device_map='auto' if device == 'cuda' else None
-        )
-        
-        # Appliquer LoRA si activé
-        if llm_config.get('use_lora', True):
-            print("🔧 Application de LoRA...")
-            
-            # Détection automatique des target_modules selon l'architecture
-            if 'phi' in model_name.lower():
-                target_modules = ["q_proj", "v_proj"]  # Phi-2
-                print("   Modules LoRA: q_proj, v_proj (Phi-2)")
-            elif 'gpt' in model_name.lower():
-                target_modules = ["c_attn", "c_proj"]  # GPT-2/DistilGPT2
-                print("   Modules LoRA: c_attn, c_proj (GPT-2)")
-            elif 'llama' in model_name.lower():
-                target_modules = ["q_proj", "v_proj", "k_proj"]  # LLaMA
-                print("   Modules LoRA: q_proj, v_proj, k_proj (LLaMA)")
-            else:
-                target_modules = ["q_proj", "v_proj"]  # Par défaut
-                print("   Modules LoRA: q_proj, v_proj (par défaut)")
-            
-            lora_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=llm_config.get('lora_r', 8),
-                lora_alpha=llm_config.get('lora_alpha', 16),
-                lora_dropout=llm_config.get('lora_dropout', 0.1),
-                target_modules=target_modules,
-                bias="none"
-            )
-            self.llm = get_peft_model(self.llm, lora_config)
-            self.llm.print_trainable_parameters()
-        
-        # 3. Couche de fusion GNN → LLM
-        gnn_dim = config.get('gnn', {}).get('hidden_channels', 128)
-        
-        # Gérer les différents noms d'attributs selon le modèle
-        if hasattr(self.llm.config, 'hidden_size'):
-            llm_dim = self.llm.config.hidden_size
-        elif hasattr(self.llm.config, 'n_embd'):
-            llm_dim = self.llm.config.n_embd
-        else:
-            llm_dim = 768  # Valeur par défaut
-        
-        print(f"   GNN dim: {gnn_dim} → LLM dim: {llm_dim}")
-        
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(gnn_dim, llm_dim),
-            nn.LayerNorm(llm_dim),
-            nn.Dropout(0.1)
-        )
-        
-        # 4. Tête de classification finale
-        self.fraud_head = nn.Sequential(
-            nn.Linear(llm_dim, llm_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(llm_dim // 2, 1)
-        )
-        
-        self.to(device)
+print(f"   ✅ GNN créé: {sum(p.numel() for p in gnn.parameters()):,} paramètres")
+print(f"   📍 Device: {next(gnn.parameters()).device}")
+
+# 2. LLM (DistilGPT2 avec LoRA)
+print("\n2️⃣ Chargement de DistilGPT2...")
+tokenizer = AutoTokenizer.from_pretrained('distilgpt2', padding_side='left')
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+llm = AutoModelForCausalLM.from_pretrained(
+    'distilgpt2',
+    torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
+    device_map='auto' if device == 'cuda' else None
+)
+
+# Application de LoRA
+print("   🔧 Application de LoRA...")
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.1,
+    target_modules=["c_attn", "c_proj"],
+    bias="none"
+)
+
+llm = get_peft_model(llm, lora_config)
+llm.print_trainable_parameters()
+print("   ✅ LLM créé avec LoRA")
+
+# 3. Couche de fusion (GNN → LLM)
+print("\n3️⃣ Création de la couche de fusion...")
+gnn_dim = gnn_config['hidden_channels']  # Utiliser la config
+llm_dim = llm.config.n_embd
+
+fusion_layer = nn.Sequential(
+    nn.Linear(gnn_dim, llm_dim),
+    nn.LayerNorm(llm_dim),
+    nn.Dropout(0.1)
+)
+
+# S'assurer que fusion_layer est sur le bon device
+fusion_layer = fusion_layer.to(device)
+for param in fusion_layer.parameters():
+    param.data = param.data.to(device)
+
+print(f"   ✅ Fusion: {gnn_dim} → {llm_dim}")
+print(f"   📍 Device: {next(fusion_layer.parameters()).device}")
+
+# 4. Tête de classification
+print("\n4️⃣ Création de la tête de classification...")
+fraud_head = nn.Sequential(
+    nn.Linear(llm_dim, llm_dim // 2),
+    nn.ReLU(),
+    nn.Dropout(0.2),
+    nn.Linear(llm_dim // 2, 1)
+)
+
+# S'assurer que fraud_head est sur le bon device
+fraud_head = fraud_head.to(device)
+for param in fraud_head.parameters():
+    param.data = param.data.to(device)
+
+print(f"   ✅ Classification: {llm_dim} → {llm_dim//2} → 1")
+print(f"   📍 Device: {next(fraud_head.parameters()).device}")
+
+# 5. Classe Wrapper pour le modèle complet
+print("\n5️⃣ Assemblage du modèle hybride...")
+
+class HybridModel(nn.Module):
+    def __init__(self, gnn, llm, fusion, classifier):
+        super().__init__()
+        self.gnn = gnn
+        self.llm = llm
+        self.fusion = fusion
+        self.classifier = classifier
     
-    def forward(self, graph_data, text_inputs=None, mode='inference'):
-        """
-        Forward pass du modèle hybride
+    def forward(self, graph_data, mode='train'):
+        # Assurer que toutes les données sont sur le bon device
+        device = next(self.gnn.parameters()).device
         
-        Args:
-            graph_data: PyTorch Geometric Data object (x, edge_index, batch)
-            text_inputs: Dict avec 'input_ids' et 'attention_mask' (optionnel)
-            mode: 'inference', 'gnn_only', 'hybrid'
+        x = graph_data.x.to(device)
+        edge_index = graph_data.edge_index.to(device)
+        batch = graph_data.batch.to(device) if hasattr(graph_data, 'batch') else None
         
-        Returns:
-            logits: Prédictions de fraude [batch_size, 1]
-            embeddings: Embeddings combinés (pour analyse)
-        """
-        
-        # 1. Extraire les embeddings du GNN
-        x = graph_data.x
-        edge_index = graph_data.edge_index
-        batch = graph_data.batch if hasattr(graph_data, 'batch') else None
-        
+        # Embeddings GNN
         gnn_embeddings = self.gnn.get_embeddings(x, edge_index, batch)
         
-        # Mode GNN uniquement (baseline)
-        if mode == 'gnn_only':
-            logits = self.gnn.classifier(gnn_embeddings)
-            return logits, gnn_embeddings
+        # Vérifier que les embeddings sont sur le bon device
+        gnn_embeddings = gnn_embeddings.to(device)
         
-        # 2. Fusionner avec le LLM
-        # Projeter les embeddings GNN dans l'espace du LLM
-        fused_embeddings = self.fusion_layer(gnn_embeddings)
+        # Fusion avec LLM
+        fused_embeddings = self.fusion(gnn_embeddings)
         
-        # 3. Si des inputs texte sont fournis, les combiner
-        if text_inputs is not None and mode == 'hybrid':
-            # Passer les inputs texte dans le LLM
-            with torch.no_grad():
-                llm_outputs = self.llm(
-                    input_ids=text_inputs['input_ids'].to(self.device),
-                    attention_mask=text_inputs['attention_mask'].to(self.device),
-                    output_hidden_states=True
-                )
-                text_embeddings = llm_outputs.hidden_states[-1][:, -1, :]  # Dernier token
-            
-            # Combiner (moyenne pondérée ou concaténation)
-            combined_embeddings = (fused_embeddings + text_embeddings) / 2
-        else:
-            combined_embeddings = fused_embeddings
+        # Classification
+        logits = self.classifier(fused_embeddings)
         
-        # 4. Prédiction finale
-        logits = self.fraud_head(combined_embeddings)
-        
-        return logits, combined_embeddings
-    
-    def generate_explanation(self, graph_data, prediction, max_length=100):
-        """
-        Générer une explication textuelle de la prédiction
-        Utilise le LLM en mode génération
-        """
-        # Extraire les embeddings
-        _, embeddings = self.forward(graph_data, mode='inference')
-        
-        # Construire le prompt
-        fraud_prob = torch.sigmoid(prediction).item()
-        prompt = f"""Analyze this transaction:
-Fraud probability: {fraud_prob:.2%}
-Reasoning:"""
-        
-        # Tokenizer
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors='pt',
-            padding=True,
-            truncation=True
-        ).to(self.device)
-        
-        # Générer
-        with torch.no_grad():
-            outputs = self.llm.generate(
-                **inputs,
-                max_new_tokens=max_length,
-                temperature=0.7,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id
-            )
-        
-        explanation = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        return explanation
-    
-    def save_pretrained(self, save_path):
-        """Sauvegarder le modèle complet"""
-        torch.save({
-            'gnn_state_dict': self.gnn.state_dict(),
-            'fusion_layer': self.fusion_layer.state_dict(),
-            'fraud_head': self.fraud_head.state_dict(),
-            'config': self.config
-        }, f"{save_path}/hybrid_model.pt")
-        
-        # Sauvegarder le LLM (avec LoRA)
-        self.llm.save_pretrained(f"{save_path}/llm")
-        self.tokenizer.save_pretrained(f"{save_path}/llm")
-        
-        print(f"✅ Modèle sauvegardé dans {save_path}")
+        return logits
 
+# Crée le modèle hybride
+model = HybridModel(gnn, llm, fusion_layer, fraud_head)
+print("   ✅ Modèle hybride assemblé")
+
+# Vérification finale des devices
+print("\n🔍 Vérification des devices:")
+print(f"   GNN:     {next(model.gnn.parameters()).device}")
+print(f"   Fusion:  {next(model.fusion.parameters()).device}")
+print(f"   Classif: {next(model.classifier.parameters()).device}")
+
+# S'assurer que tout le modèle est sur le bon device
+model = model.to(device)
+
+# ============================================
+# STATISTIQUES DU MODÈLE
+# ============================================
+
+print("\n" + "="*60)
+print("📊 STATISTIQUES DU MODÈLE HYBRIDE")
+print("="*60)
+
+gnn_params = sum(p.numel() for p in gnn.parameters())
+llm_params = sum(p.numel() for p in llm.parameters())
+fusion_params = sum(p.numel() for p in fusion_layer.parameters())
+head_params = sum(p.numel() for p in fraud_head.parameters())
+total_params = gnn_params + llm_params + fusion_params + head_params
+
+llm_trainable = sum(p.numel() for p in llm.parameters() if p.requires_grad)
+total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+print(f"\n📦 Paramètres par composant:")
+print(f"   GNN:            {gnn_params:>15,}")
+print(f"   LLM:            {llm_params:>15,}")
+print(f"   Fusion:         {fusion_params:>15,}")
+print(f"   Classification: {head_params:>15,}")
+print(f"   {'─'*35}")
+print(f"   TOTAL:          {total_params:>15,}")
+
+print(f"\n🎯 Paramètres entraînables:")
+print(f"   LLM (LoRA):     {llm_trainable:>15,}")
+print(f"   Total:          {total_trainable:>15,}")
+print(f"   Ratio:          {100 * total_trainable / total_params:>14.2f}%")
+
+print("\n" + "="*60)
+print("✅ MODÈLE HYBRIDE PRÊT POUR L'ENTRAÎNEMENT!")
+print("="*60)
+
+# ============================================
+# TEST AVEC DONNÉES SYNTHÉTIQUES
+# ============================================
+
+print("\n🧪 Test rapide du modèle avec des données synthétiques...")
+
+# Créer 5 graphes de test
+test_graphs = []
+num_test_graphs = 5
+num_nodes_per_graph = 10
+
+for i in range(num_test_graphs):
+    # Générer des features aléatoires sur le bon device
+    x = torch.randn(num_nodes_per_graph, gnn_config['input_dim'], device=device)
+    
+    # Créer des edges aléatoires (graphe connecté)
+    edge_index = torch.tensor([
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 0],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 9]
+    ], dtype=torch.long, device=device)
+    
+    graph = Data(x=x, edge_index=edge_index)
+    test_graphs.append(graph)
+
+# Créer un batch
+sample_data = Batch.from_data_list(test_graphs)
+print(f"   Batch créé: {sample_data.num_graphs} graphes, {sample_data.num_nodes} nœuds")
+print(f"   Features shape: {sample_data.x.shape}")
+print(f"   Device des données: {sample_data.x.device}")
 
 # Test du modèle
-if __name__ == "__main__":
-    print("🧪 Test du HybridFraudDetector...")
+model.eval()
+with torch.no_grad():
+    output = model(sample_data)
+    predictions = torch.sigmoid(output).squeeze().cpu().numpy()
     
-    # Test avec DistilGPT2 (léger)
-    config_distilgpt2 = {
-        'gnn': {
-            'hidden_channels': 128,
-            'num_layers': 2,
-            'dropout': 0.3,
-            'heads': 4
-        },
-        'llm': {
-            'model_name': 'distilgpt2',
-            'use_lora': True,
-            'lora_r': 8,
-            'lora_alpha': 16
-        }
-    }
+    print("✅ Test réussi!")
+    print(f"   Output shape: {output.shape}")
+    print(f"\n📊 Prédictions sur {num_test_graphs} transactions:")
     
-    # Test avec Phi-2 (plus lourd)
-    config_phi2 = {
-        'gnn': {
-            'hidden_channels': 128,
-            'num_layers': 2,
-            'dropout': 0.3,
-            'heads': 4
-        },
-        'llm': {
-            'model_name': 'microsoft/phi-2',
-            'use_lora': True,
-            'lora_r': 8,
-            'lora_alpha': 32
-        }
-    }
+    # Gérer le cas où predictions est un scalaire ou un vecteur
+    if predictions.ndim == 0:
+        predictions = [predictions.item()]
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"🖥️  Device: {device}")
-    
-    print("\n📝 Configurations disponibles:")
-    print("  1. config_distilgpt2 (léger, ~500MB)")
-    print("  2. config_phi2 (lourd, ~6GB)")
-    print("\n  Décommentez pour tester:")
-    print("# model = HybridFraudDetector(config_distilgpt2, device=device)")
+    for i, pred in enumerate(predictions):
+        label = "🚨 FRAUDE" if pred > 0.5 else "✅ LÉGIT"
+        confidence = pred if pred > 0.5 else (1 - pred)
+        bar = "█" * int(confidence * 20)
+        print(f"   Transaction {i+1}: {pred:.4f} {label} [{bar:<20}] {confidence:.1%}")
+
+print("\n🎉 Le modèle hybride est complètement opérationnel!")
+
+# ============================================
+# SAUVEGARDE DU MODÈLE (optionnel)
+# ============================================
+
+print("\n💾 Sauvegarde du modèle...")
+save_path = "/kaggle/working/hybrid_model_checkpoint.pt"
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'gnn_config': gnn_config,
+    'lora_config': lora_config.__dict__,
+    'total_params': total_params,
+    'trainable_params': total_trainable
+}, save_path)
+print(f"   ✅ Modèle sauvegardé: {save_path}")
