@@ -1,6 +1,8 @@
 # Core Dependencies
 torch>=2.0.0
 torch-geometric>=2.3.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.0
 transformers>=4.35.0
 peft>=0.7.0
 trl>=0.7.0
@@ -63,4 +65,5 @@ redis>=5.0.0
 
 # Security
 python-multipart>=0.0.6
+cryptography>=41.0.0
 cryptography>=41.0.0
