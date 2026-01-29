@@ -1,3 +1,8 @@
+"""
+Cellule Kaggle: Créer le Modèle Hybride Complet
+GNN + DistilGPT2 avec LoRA pour la détection de fraude
+"""
+
 import sys
 import os
 import torch
@@ -25,9 +30,9 @@ print("="*60)
 print("\n1️⃣ Création du GNN...")
 from src.models.gnn_model import GNNModel
 
-# Configuration complète du GNN avec input_dim
+# Configuration complète du GNN
 gnn_config = {
-    'input_dim': 64,          # IMPORTANT: Dimension des features d'entrée
+    'input_dim': 64,          # Dimension des features d'entrée
     'hidden_channels': 128,
     'num_layers': 2,
     'dropout': 0.3,
@@ -74,7 +79,7 @@ print("   ✅ LLM créé avec LoRA")
 
 # 3. Couche de fusion (GNN → LLM)
 print("\n3️⃣ Création de la couche de fusion...")
-gnn_dim = gnn_config['hidden_channels']  # Utiliser la config
+gnn_dim = gnn_config['hidden_channels']
 llm_dim = llm.config.n_embd
 
 fusion_layer = nn.Sequential(
@@ -141,7 +146,7 @@ class HybridModel(nn.Module):
         
         return logits
 
-# Crée le modèle hybride
+# Créer le modèle hybride
 model = HybridModel(gnn, llm, fusion_layer, fraud_head)
 print("   ✅ Modèle hybride assemblé")
 
@@ -241,16 +246,37 @@ with torch.no_grad():
 print("\n🎉 Le modèle hybride est complètement opérationnel!")
 
 # ============================================
-# SAUVEGARDE DU MODÈLE (optionnel)
+# SAUVEGARDE INITIALE DU MODÈLE
 # ============================================
 
-print("\n💾 Sauvegarde du modèle...")
-save_path = "/kaggle/working/hybrid_model_checkpoint.pt"
+print("\n💾 Sauvegarde du modèle initial...")
+save_dir = "/kaggle/working/initial_model"
+os.makedirs(save_dir, exist_ok=True)
+
+save_path = f"{save_dir}/hybrid_model_initial.pt"
 torch.save({
     'model_state_dict': model.state_dict(),
     'gnn_config': gnn_config,
-    'lora_config': lora_config.__dict__,
+    'lora_config': {
+        'r': lora_config.r,
+        'lora_alpha': lora_config.lora_alpha,
+        'lora_dropout': lora_config.lora_dropout,
+        'target_modules': lora_config.target_modules
+    },
     'total_params': total_params,
     'trainable_params': total_trainable
 }, save_path)
-print(f"   ✅ Modèle sauvegardé: {save_path}")
+
+print(f"   ✅ Modèle initial sauvegardé: {save_path}")
+
+print("\n" + "="*60)
+print("🎯 PRÊT POUR L'ENTRAÎNEMENT!")
+print("="*60)
+print("\n💡 Variables créées et disponibles:")
+print("   - model: Le modèle hybride complet")
+print("   - gnn: Le Graph Neural Network")
+print("   - llm: Le DistilGPT2 avec LoRA")
+print("   - fusion_layer: La couche de fusion")
+print("   - fraud_head: La tête de classification")
+print("   - gnn_config: Configuration du GNN")
+print("\n➡️  Vous pouvez maintenant passer à la cellule d'entraînement!")
