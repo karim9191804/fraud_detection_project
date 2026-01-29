@@ -1,0 +1,138 @@
+# Configuration Principale - Projet Détection de Fraude GNN+LLM+RLHF
+project:
+  name: "fraud-detection-gnn-llm-rlhf"
+  version: "1.0.0"
+  description: "Real-time fraud detection with GNN+LLM and RLHF"
+
+# Chemins
+paths:
+  data_dir: "data/raw"
+  processed_dir: "data/processed"
+  models_dir: "models"
+  logs_dir: "logs"
+  checkpoints_dir: "checkpoints"
+  memory_dir: "memory"
+  
+# GitHub Configuration
+github:
+  repo: "votre-username/fraud-detection-project"
+  branch: "main"
+  auto_sync: true
+  sync_interval: 300  # secondes
+  
+# Kaggle Configuration
+kaggle:
+  dataset: "ieee-fraud-detection"
+  username: "votre-username"
+  auto_sync: true
+  notebook_sync: true
+  
+# Hugging Face Deployment
+huggingface:
+  repo_id: "votre-username/fraud-detection-app"
+  token: "hf_token_placeholder"
+  space_type: "gradio"
+  
+# Dataset Configuration
+dataset:
+  name: "IEEE-CIS Fraud Detection"
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  batch_size: 128  # CPU: 32-64, GPU: 128-256, P100: 256-512
+  num_workers: 4   # CPU: 2-4, GPU: 4-8, Kaggle: 0 (single process)
+  pin_memory: true # Active pour GPU
+  persistent_workers: false # Désactivé pour Kaggle
+  
+# GNN Configuration
+gnn:
+  model_type: "GCN"  # GCN, GAT, GraphSAGE
+  hidden_channels: 256
+  num_layers: 3
+  dropout: 0.3
+  heads: 8  # pour GAT
+  
+# LLM Configuration
+llm:
+  model_name: "microsoft/phi-2"  # Petit modèle pour commencer
+  max_length: 512
+  temperature: 0.7
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  
+# Architecture Jour/Nuit
+day_night_cycle:
+  # Mode JOUR (8h-20h)
+  day:
+    mode: "inference"
+    save_critical_cases: true
+    save_feedback: true
+    human_verification_threshold: 0.7
+    real_time_monitoring: true
+    
+  # Mode NUIT (20h-8h)
+  night:
+    mode: "training"
+    fine_tuning: true
+    rlhf_training: true
+    batch_processing: true
+    auto_validation: true
+    
+  # Mode MATIN (validation)
+  morning:
+    validation_time: "07:00"
+    human_check_required: true
+    deploy_if_approved: true
+    
+# RLHF Configuration
+rlhf:
+  reward_model: "custom"
+  ppo_epochs: 4
+  learning_rate: 1e-5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  
+# Fine-tuning Configuration
+fine_tuning:
+  learning_rate: 2e-5
+  num_epochs: 3
+  warmup_steps: 100
+  weight_decay: 0.01
+  gradient_accumulation_steps: 4
+  
+# Metrics à suivre
+metrics:
+  - "accuracy"
+  - "precision"
+  - "recall"
+  - "f1_score"
+  - "roc_auc"
+  - "average_precision"
+  - "confusion_matrix"
+  - "fraud_detection_rate"
+  - "false_positive_rate"
+  
+# Mémoire Temporelle
+memory:
+  save_critical_cases: true
+  save_feedback: true
+  max_memory_size: 10000
+  memory_retention_days: 30
+  
+# Monitoring & Alertes
+monitoring:
+  enable_wandb: true
+  enable_tensorboard: true
+  alert_email: "votre-email@example.com"
+  alert_threshold: 0.5
+  
+# Sécurité
+security:
+  human_verification_required: true
+  verification_threshold: 0.7
+  auto_block_threshold: 0.9
+  log_all_decisions: true

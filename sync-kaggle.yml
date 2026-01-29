@@ -1,0 +1,104 @@
+name: Sync with Kaggle
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 */6 * * *'  # Toutes les 6 heures
+  workflow_dispatch:  # Permettre déclenchement manuel
+
+jobs:
+  sync-to-kaggle:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install kaggle PyGithub gitpython pyyaml
+    
+    - name: Configure Kaggle
+      env:
+        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      run: |
+        mkdir -p ~/.kaggle
+        echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
+        chmod 600 ~/.kaggle/kaggle.json
+    
+    - name: Update Kaggle Dataset
+      env:
+        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      run: |
+        # Créer metadata pour le dataset
+        cat > dataset-metadata.json <<EOF
+        {
+          "title": "Fraud Detection Code",
+          "id": "$KAGGLE_USERNAME/fraud-detection-code",
+          "licenses": [{"name": "MIT"}]
+        }
+        EOF
+        
+        # Upload ou update le dataset
+        kaggle datasets version -p . -m "Auto-sync from GitHub $(date)" || \
+        kaggle datasets create -p .
+    
+    - name: Upload Kaggle Notebook
+      env:
+        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      run: |
+        # Push le notebook d'entraînement
+        python - <<EOF
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        
+        api = KaggleApi()
+        api.authenticate()
+        
+        # Créer metadata du kernel
+        import json
+        kernel_metadata = {
+            "id": "$KAGGLE_USERNAME/fraud-detection-training",
+            "title": "Fraud Detection Training GPU",
+            "code_file": "kaggle_train_gpu.ipynb",
+            "language": "python",
+            "kernel_type": "notebook",
+            "is_private": False,
+            "enable_gpu": True,
+            "enable_internet": True,
+            "dataset_sources": ["ieee-fraud-detection"],
+            "competition_sources": [],
+            "kernel_sources": []
+        }
+        
+        with open('kernel-metadata.json', 'w') as f:
+            json.dump(kernel_metadata, f)
+        
+        # Push
+        try:
+            api.kernels_push('.')
+            print("✅ Notebook pushed to Kaggle")
+        except Exception as e:
+            print(f"⚠️ Error: {e}")
+        EOF
+    
+    - name: Commit sync status
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        echo "Last sync: $(date)" > .last_sync
+        git add .last_sync
+        git commit -m "Update sync status [skip ci]" || echo "No changes"
+        
+    - name: Push changes
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: main
