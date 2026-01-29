@@ -1,6 +1,6 @@
 """
 Modèle hybride GNN + LLM pour la détection de fraude
-Combine les embeddings du GNN avec un LLM (Phi-2) pour l'analyse contextuelle
+Combine les embeddings du GNN avec un LLM (DistilGPT2/Phi-2) pour l'analyse contextuelle
 """
 
 import torch
@@ -15,7 +15,7 @@ class HybridFraudDetector(nn.Module):
     """
     Détecteur de fraude hybride combinant :
     - GNN (GAT) pour l'analyse structurelle du graphe de transactions
-    - LLM (Phi-2 + LoRA) pour l'analyse contextuelle et le raisonnement
+    - LLM (DistilGPT2/Phi-2 + LoRA) pour l'analyse contextuelle et le raisonnement
     """
     
     def __init__(self, config, device='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -28,15 +28,19 @@ class HybridFraudDetector(nn.Module):
         print("🔧 Initialisation du GNN (GAT)...")
         self.gnn = GNNModel(config.get('gnn', {}))
         
-        # 2. Composant LLM (Phi-2 avec LoRA)
-        print("🔧 Chargement du LLM (microsoft/phi-2)...")
+        # 2. Composant LLM avec détection automatique
         llm_config = config.get('llm', {})
-        model_name = llm_config.get('model_name', 'microsoft/phi-2')
+        model_name = llm_config.get('model_name', 'distilgpt2')  # Par défaut DistilGPT2
+        
+        print(f"🔧 Chargement du LLM ({model_name})...")
+        
+        # Déterminer si trust_remote_code est nécessaire
+        trust_remote_code = 'phi' in model_name.lower()
         
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             padding_side='left'
         )
         
@@ -47,7 +51,7 @@ class HybridFraudDetector(nn.Module):
         # Charger le modèle de base
         self.llm = AutoModelForCausalLM.from_pretrained(
             model_name,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
             device_map='auto' if device == 'cuda' else None
         )
@@ -55,20 +59,44 @@ class HybridFraudDetector(nn.Module):
         # Appliquer LoRA si activé
         if llm_config.get('use_lora', True):
             print("🔧 Application de LoRA...")
+            
+            # Détection automatique des target_modules selon l'architecture
+            if 'phi' in model_name.lower():
+                target_modules = ["q_proj", "v_proj"]  # Phi-2
+                print("   Modules LoRA: q_proj, v_proj (Phi-2)")
+            elif 'gpt' in model_name.lower():
+                target_modules = ["c_attn", "c_proj"]  # GPT-2/DistilGPT2
+                print("   Modules LoRA: c_attn, c_proj (GPT-2)")
+            elif 'llama' in model_name.lower():
+                target_modules = ["q_proj", "v_proj", "k_proj"]  # LLaMA
+                print("   Modules LoRA: q_proj, v_proj, k_proj (LLaMA)")
+            else:
+                target_modules = ["q_proj", "v_proj"]  # Par défaut
+                print("   Modules LoRA: q_proj, v_proj (par défaut)")
+            
             lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=llm_config.get('lora_r', 8),
-                lora_alpha=llm_config.get('lora_alpha', 32),
+                lora_alpha=llm_config.get('lora_alpha', 16),
                 lora_dropout=llm_config.get('lora_dropout', 0.1),
-                target_modules=["q_proj", "v_proj"],  # Phi-2 architecture
+                target_modules=target_modules,
                 bias="none"
             )
             self.llm = get_peft_model(self.llm, lora_config)
             self.llm.print_trainable_parameters()
         
         # 3. Couche de fusion GNN → LLM
-        gnn_dim = config.get('gnn', {}).get('hidden_channels', 256)
-        llm_dim = self.llm.config.hidden_size
+        gnn_dim = config.get('gnn', {}).get('hidden_channels', 128)
+        
+        # Gérer les différents noms d'attributs selon le modèle
+        if hasattr(self.llm.config, 'hidden_size'):
+            llm_dim = self.llm.config.hidden_size
+        elif hasattr(self.llm.config, 'n_embd'):
+            llm_dim = self.llm.config.n_embd
+        else:
+            llm_dim = 768  # Valeur par défaut
+        
+        print(f"   GNN dim: {gnn_dim} → LLM dim: {llm_dim}")
         
         self.fusion_layer = nn.Sequential(
             nn.Linear(gnn_dim, llm_dim),
@@ -193,7 +221,24 @@ Reasoning:"""
 if __name__ == "__main__":
     print("🧪 Test du HybridFraudDetector...")
     
-    config = {
+    # Test avec DistilGPT2 (léger)
+    config_distilgpt2 = {
+        'gnn': {
+            'hidden_channels': 128,
+            'num_layers': 2,
+            'dropout': 0.3,
+            'heads': 4
+        },
+        'llm': {
+            'model_name': 'distilgpt2',
+            'use_lora': True,
+            'lora_r': 8,
+            'lora_alpha': 16
+        }
+    }
+    
+    # Test avec Phi-2 (plus lourd)
+    config_phi2 = {
         'gnn': {
             'hidden_channels': 128,
             'num_layers': 2,
@@ -211,7 +256,8 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"🖥️  Device: {device}")
     
-    # Modèle (attention: télécharge Phi-2 ~3GB)
-    # model = HybridFraudDetector(config, device=device)
-    # print("✅ Modèle hybride créé")
-    print("⚠️ Décommentez pour tester (télécharge Phi-2)")
+    print("\n📝 Configurations disponibles:")
+    print("  1. config_distilgpt2 (léger, ~500MB)")
+    print("  2. config_phi2 (lourd, ~6GB)")
+    print("\n  Décommentez pour tester:")
+    print("# model = HybridFraudDetector(config_distilgpt2, device=device)")
