@@ -1,0 +1,107 @@
+# Configuration Légère - Fraud Detection GNN+LLM+RLHF
+# Optimisé pour dataset 25% et training rapide
+
+# ============================================================
+# DATASET CONFIGURATION
+# ============================================================
+dataset:
+  name: "ieee-fraud-detection"
+  sampling_fraction: 0.25  # Utiliser 25% du dataset
+  test_size: 0.15
+  val_size: 0.15
+  batch_size: 64  # Adapté pour 25% dataset
+  num_workers: 0  # 0 sur Kaggle
+  pin_memory: true
+  
+# ============================================================
+# GNN CONFIGURATION (Léger)
+# ============================================================
+gnn:
+  model_type: "GAT"  # Graph Attention Network
+  in_channels: 432  # Nombre de features IEEE-CIS
+  hidden_channels: 64  # Réduit pour rapidité
+  num_layers: 2  # 2 couches seulement
+  dropout: 0.3
+  heads: 2  # 2 attention heads
+  pooling: "mean"  # Global mean pooling
+
+# ============================================================
+# LLM CONFIGURATION (DistilBERT)
+# ============================================================
+llm:
+  model_name: "distilbert-base-uncased"  # 66M params
+  max_length: 128  # Court pour rapidité
+  temperature: 0.7
+  use_lora: true  # Fine-tuning efficace
+  lora_r: 4  # Très léger
+  lora_alpha: 8
+  lora_dropout: 0.1
+  
+# ============================================================
+# HYBRID MODEL CONFIGURATION
+# ============================================================
+hybrid:
+  projector_hidden: 256
+  fusion_hidden: 64
+  
+# ============================================================
+# TRAINING CONFIGURATION
+# ============================================================
+training:
+  num_epochs: 2  # Réduit pour dataset 25%
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  optimizer: "AdamW"
+  scheduler: "cosine"
+  warmup_steps: 100
+  gradient_clip: 1.0
+  
+# ============================================================
+# DAY/NIGHT/MORNING SYSTEM
+# ============================================================
+day_night:
+  # JOUR: Inférence
+  day:
+    save_critical: true
+    confidence_threshold: 0.7  # Sauver si confidence < 0.7
+    
+  # NUIT: Fine-tuning + RLHF
+  night:
+    gnn_epochs: 2
+    llm_rlhf_steps: 50  # Limité pour rapidité
+    freeze_llm_during_gnn: true
+    freeze_gnn_during_rlhf: true
+    
+  # MATIN: Validation
+  morning:
+    deploy_thresholds:
+      f1_min: 0.75
+      precision_min: 0.70
+      recall_min: 0.70
+      
+# ============================================================
+# RLHF CONFIGURATION
+# ============================================================
+rlhf:
+  reward_type: "accuracy_based"  # Simplifié
+  learning_rate: 5e-5
+  max_feedback_cases: 50
+  policy_gradient_clip: 1.0
+  
+# ============================================================
+# LOGGING & CHECKPOINTING
+# ============================================================
+logging:
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  memory_dir: "memory"
+  save_every_n_epochs: 1
+  log_every_n_steps: 50
+  
+# ============================================================
+# DEPLOYMENT
+# ============================================================
+deployment:
+  model_save_path: "final_model"
+  push_to_github: true
+  push_to_huggingface: false  # À activer plus tard
