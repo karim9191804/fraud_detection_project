@@ -1,434 +1,444 @@
 """
-Kaggle Notebook: Fraud Detection avec GNN + LLM Hybrid
-Dataset: IEEE-CIS Fraud Detection
-Architecture: GNN (GAT) + DistilGPT2 avec LoRA
+╔══════════════════════════════════════════════════════════════╗
+║  FRAUD DETECTION - PIPELINE COMPLET GNN + LLM                ║
+║  Version finale optimisée GPU                                 ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
 # ============================================
-# CELLULE 1: INSTALLATION ET SETUP
+# 🔧 SETUP ET CLONE GITHUB
 # ============================================
 
-print("="*80)
-print("🚀 FRAUD DETECTION SYSTEM - GNN + LLM HYBRID")
-print("="*80)
-
-# Cloner le repository
-get_ipython().system('git clone https://github.com/karim9191804/fraud_detection_project.git')
-get_ipython().magic('cd fraud_detection_project')
-
-# Installer les dépendances
-get_ipython().system('pip install -r requirements.txt -q')
-
-print("\n✅ Installation terminée!")
-print("📦 Packages installés:")
-print("   - torch, torch-geometric")
-print("   - transformers, peft")
-print("   - scikit-learn, matplotlib, seaborn")
-
-# ============================================
-# CELLULE 2: CHARGEMENT DES DONNÉES
-# ============================================
-
-import sys
-sys.path.insert(0, '/kaggle/working/fraud_detection_project')
-
-from src.data.ieee_dataset import load_ieee_dataset
-
-print("\n" + "="*80)
-print("📊 CHARGEMENT DU DATASET IEEE-CIS")
-print("="*80)
-
-# Charger le dataset
-dataset = load_ieee_dataset(
-    data_dir='/kaggle/input/ieee-fraud-detection',
-    use_sample=False,  # False pour dataset complet, True pour test rapide
-    test_size=0.2,
-    val_size=0.1,
-    random_state=42
-)
-
-print(f"\n✅ Dataset chargé:")
-print(f"   Train: {len(dataset['train'])} samples")
-print(f"   Val:   {len(dataset['val'])} samples")
-print(f"   Test:  {len(dataset['test'])} samples")
-
-# Distribution des classes
-train_labels = [data.y.item() for data in dataset['train']]
-fraud_count = sum(train_labels)
-legit_count = len(train_labels) - fraud_count
-
-print(f"\n📈 Distribution des classes:")
-print(f"   Fraudes: {fraud_count:,} ({100*fraud_count/len(train_labels):.2f}%)")
-print(f"   Légitimes: {legit_count:,} ({100*legit_count/len(train_labels):.2f}%)")
-print(f"   Ratio: 1:{legit_count/fraud_count:.1f}")
-
-# ============================================
-# CELLULE 3: CRÉATION DU MODÈLE HYBRIDE
-# ============================================
-
-import torch
-import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model, TaskType
-from torch_geometric.data import Data, Batch
-
-print("\n" + "="*80)
-print("🧠 CRÉATION DU MODÈLE HYBRIDE GNN + DistilGPT2")
-print("="*80)
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"🖥️  Device: {device}")
-
-# 1. GNN (Graph Neural Network)
-print("\n1️⃣ Création du GNN...")
-from src.models.gnn_model import GNNModel
-
-gnn_config = {
-    'input_dim': 64,
-    'hidden_channels': 128,
-    'num_layers': 2,
-    'dropout': 0.3,
-    'heads': 4
-}
-
-gnn = GNNModel(gnn_config).to(device)
-print(f"   ✅ GNN créé: {sum(p.numel() for p in gnn.parameters()):,} paramètres")
-
-# 2. LLM (DistilGPT2 avec LoRA)
-print("\n2️⃣ Chargement de DistilGPT2...")
-tokenizer = AutoTokenizer.from_pretrained('distilgpt2', padding_side='left')
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-llm = AutoModelForCausalLM.from_pretrained(
-    'distilgpt2',
-    torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
-    device_map='auto' if device == 'cuda' else None
-)
-
-# Application de LoRA
-print("   🔧 Application de LoRA...")
-lora_config = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    r=8,
-    lora_alpha=16,
-    lora_dropout=0.1,
-    target_modules=["c_attn", "c_proj"],
-    bias="none"
-)
-
-llm = get_peft_model(llm, lora_config)
-llm.print_trainable_parameters()
-
-# 3. Couche de fusion
-print("\n3️⃣ Création de la couche de fusion...")
-fusion_layer = nn.Sequential(
-    nn.Linear(128, llm.config.n_embd),
-    nn.LayerNorm(llm.config.n_embd),
-    nn.Dropout(0.1)
-).to(device)
-
-# 4. Tête de classification
-print("\n4️⃣ Création de la tête de classification...")
-fraud_head = nn.Sequential(
-    nn.Linear(llm.config.n_embd, llm.config.n_embd // 2),
-    nn.ReLU(),
-    nn.Dropout(0.2),
-    nn.Linear(llm.config.n_embd // 2, 1)
-).to(device)
-
-# 5. Modèle hybride complet
-print("\n5️⃣ Assemblage du modèle hybride...")
-
-class HybridModel(nn.Module):
-    def __init__(self, gnn, llm, fusion, classifier):
-        super().__init__()
-        self.gnn = gnn
-        self.llm = llm
-        self.fusion = fusion
-        self.classifier = classifier
-    
-    def forward(self, graph_data, mode='train'):
-        device = next(self.gnn.parameters()).device
-        
-        x = graph_data.x.to(device)
-        edge_index = graph_data.edge_index.to(device)
-        batch = graph_data.batch.to(device) if hasattr(graph_data, 'batch') else None
-        
-        gnn_embeddings = self.gnn.get_embeddings(x, edge_index, batch)
-        fused_embeddings = self.fusion(gnn_embeddings)
-        logits = self.classifier(fused_embeddings)
-        
-        return logits
-
-model = HybridModel(gnn, llm, fusion_layer, fraud_head).to(device)
-
-# Statistiques
-total_params = sum(p.numel() for p in model.parameters())
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-print(f"\n📊 Statistiques du modèle:")
-print(f"   Paramètres totaux: {total_params:,}")
-print(f"   Paramètres entraînables: {trainable_params:,}")
-print(f"   Ratio: {100 * trainable_params / total_params:.2f}%")
-
-print("\n✅ Modèle hybride prêt!")
-
-# ============================================
-# CELLULE 4: CONFIGURATION D'ENTRAÎNEMENT
-# ============================================
-
-from torch_geometric.loader import DataLoader
 import os
+import sys
+import torch
 
-print("\n" + "="*80)
-print("⚙️  CONFIGURATION D'ENTRAÎNEMENT")
-print("="*80)
+print("="*60)
+print("🚀 FRAUD DETECTION PIPELINE - VERSION FINALE")
+print("="*60)
 
-# DataLoaders
-BATCH_SIZE = 32
-
-train_loader = DataLoader(
-    dataset['train'], 
-    batch_size=BATCH_SIZE, 
-    shuffle=True,
-    num_workers=2,
-    pin_memory=True
-)
-
-val_loader = DataLoader(
-    dataset['val'], 
-    batch_size=BATCH_SIZE, 
-    shuffle=False,
-    num_workers=2,
-    pin_memory=True
-)
-
-test_loader = DataLoader(
-    dataset['test'], 
-    batch_size=BATCH_SIZE, 
-    shuffle=False,
-    num_workers=2,
-    pin_memory=True
-)
-
-print(f"✅ DataLoaders créés (batch_size={BATCH_SIZE})")
-
-# Configuration du trainer
-training_config = {
-    # Learning rates différentiels
-    'gnn_lr': 2e-4,
-    'llm_lr': 2e-5,
-    'classifier_lr': 2e-4,
-    
-    # Optimizer
-    'adam_betas': (0.9, 0.999),
-    'adam_eps': 1e-8,
-    'weight_decay': 1e-5,
-    
-    # Loss function
-    'use_focal_loss': True,
-    'focal_alpha': 0.25,
-    'focal_gamma': 2.0,
-    'pos_weight': 10.0,
-    
-    # Scheduler
-    'use_scheduler': True,
-    'warmup_epochs': 2,
-    'lr_patience': 3,
-    'lr_factor': 0.5,
-    'min_lr': 1e-6,
-    
-    # Training
-    'grad_clip': 1.0,
-    'patience': 5,
-    'min_delta': 1e-4,
-    
-    # Cas critiques
-    'save_critical_cases': True,
-    'critical_confidence_threshold': 0.6,
-    'max_critical_cases': 1000,
-    
-    # Critères de déploiement
-    'deploy_min_f1': 0.75,
-    'deploy_min_precision': 0.70,
-    'deploy_min_recall': 0.70,
-    'deploy_max_fpr': 0.10,
-    
-    # Chemins
-    'checkpoint_dir': '/kaggle/working/checkpoints',
-    'logs_dir': '/kaggle/working/logs',
-    'device': device
-}
-
-# Créer les dossiers
-os.makedirs(training_config['checkpoint_dir'], exist_ok=True)
-os.makedirs(training_config['logs_dir'], exist_ok=True)
-
-print("\n📋 Configuration:")
-print(f"   GNN LR: {training_config['gnn_lr']}")
-print(f"   LLM LR: {training_config['llm_lr']}")
-print(f"   Focal Loss: {training_config['use_focal_loss']}")
-print(f"   Warm-up: {training_config['warmup_epochs']} epochs")
-print(f"   Patience: {training_config['patience']}")
-
-# ============================================
-# CELLULE 5: ENTRAÎNEMENT
-# ============================================
-
-from src.training.trainer import FraudDetectionTrainer
-
-print("\n" + "="*80)
-print("🏋️ ENTRAÎNEMENT DU MODÈLE")
-print("="*80)
-
-# Créer le trainer
-trainer = FraudDetectionTrainer(model, training_config)
-
-# Entraîner
-NUM_EPOCHS = 15
-
-trainer.train(
-    train_loader=train_loader,
-    val_loader=val_loader,
-    num_epochs=NUM_EPOCHS
-)
-
-print("\n✅ Entraînement terminé!")
-
-# ============================================
-# CELLULE 6: VISUALISATION DES RÉSULTATS
-# ============================================
-
-print("\n" + "="*80)
-print("📊 VISUALISATION DES RÉSULTATS")
-print("="*80)
-
-# Créer les graphiques
-trainer.plot_results(
-    save_path=f"{training_config['logs_dir']}/training_results.png"
-)
-
-print(f"\n🏆 Meilleure performance:")
-print(f"   Epoch: {trainer.best_epoch}")
-print(f"   Val Loss: {trainer.best_val_loss:.4f}")
-print(f"   Val F1: {trainer.best_val_f1:.4f}")
-
-# Statistiques des cas critiques
-if trainer.critical_cases:
-    avg_conf = sum(c['confidence'] for c in trainer.critical_cases) / len(trainer.critical_cases)
-    avg_fraud = sum(c['fraud_prob'] for c in trainer.critical_cases) / len(trainer.critical_cases)
-    
-    print(f"\n🔍 Cas critiques détectés:")
-    print(f"   Total: {len(trainer.critical_cases)}")
-    print(f"   Confiance moyenne: {avg_conf:.4f}")
-    print(f"   Prob. fraude moyenne: {avg_fraud:.4f}")
-
-# ============================================
-# CELLULE 7: ÉVALUATION FINALE (MODE MORNING)
-# ============================================
-
-from src.training.trainer import compute_metrics, check_deployment_criteria
-import numpy as np
-
-print("\n" + "="*80)
-print("🌅 VALIDATION FINALE (MODE MORNING)")
-print("="*80)
-
-# Charger le meilleur modèle
-best_checkpoint = torch.load(f"{training_config['checkpoint_dir']}/best_model.pt")
-model.load_state_dict(best_checkpoint['model_state_dict'])
-
-print(f"📂 Meilleur modèle chargé (Epoch {best_checkpoint['epoch']})")
-
-# Évaluation sur le test set
-model.eval()
-test_preds = []
-test_labels = []
-
-with torch.no_grad():
-    for data in test_loader:
-        data = data.to(device)
-        logits = model(data).squeeze()
-        if logits.dim() == 0:
-            logits = logits.unsqueeze(0)
-        
-        preds = torch.sigmoid(logits).cpu().numpy()
-        test_preds.extend(preds)
-        test_labels.extend(data.y.cpu().numpy())
-
-# Calculer les métriques
-test_metrics = compute_metrics(
-    predictions=np.array(test_preds),
-    labels=np.array(test_labels)
-)
-
-print(f"\n📊 Métriques Test Set:")
-print(f"   Accuracy:  {test_metrics['accuracy']:.4f}")
-print(f"   Precision: {test_metrics['precision']:.4f}")
-print(f"   Recall:    {test_metrics['recall']:.4f}")
-print(f"   F1:        {test_metrics['f1']:.4f}")
-print(f"   AUC:       {test_metrics['auc']:.4f}")
-if 'fpr' in test_metrics:
-    print(f"   FPR:       {test_metrics['fpr']:.4f}")
-    print(f"   FNR:       {test_metrics['fnr']:.4f}")
-
-# Vérifier les critères de déploiement
-can_deploy, criteria = check_deployment_criteria(test_metrics, training_config)
-
-print(f"\n{'='*80}")
-if can_deploy:
-    print("✅ MODÈLE VALIDÉ POUR LE DÉPLOIEMENT!")
-    print("="*80)
-    print("\nTous les critères sont remplis:")
-    for criterion, passed in criteria.items():
-        print(f"   ✓ {criterion}")
+# Vérifier GPU FIRST
+if not torch.cuda.is_available():
+    print("⚠️  WARNING: GPU non disponible, utilisation CPU (très lent)")
+    device = torch.device('cpu')
 else:
-    print("⚠️ MODÈLE NON VALIDÉ POUR LE DÉPLOIEMENT")
-    print("="*80)
-    print("\nCritères non remplis:")
-    for criterion, passed in criteria.items():
-        status = "✓" if passed else "✗"
-        print(f"   {status} {criterion}")
+    device = torch.device('cuda')
+    print(f"✅ GPU détecté: {torch.cuda.get_device_name(0)}")
+    print(f"   Mémoire: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-# Sauvegarder le rapport final
+# Clone GitHub
+if not os.path.exists('/kaggle/working/fraud_detection_project'):
+    print("\n📥 Clonage depuis GitHub...")
+    get_ipython().system('git clone https://github.com/karim9191804/fraud_detection_project.git /kaggle/working/fraud_detection_project')
+    
+os.chdir('/kaggle/working/fraud_detection_project/fraud_detection')
+
+# Installation dépendances
+print("\n📦 Installation dépendances...")
+get_ipython().system('pip install -q -r requirements.txt')
+
+sys.path.insert(0, '/kaggle/working/fraud_detection_project/fraud_detection')
+
+print("✅ Setup terminé\n")
+
+# ============================================
+# 📦 IMPORTS
+# ============================================
+
+import pandas as pd
+import numpy as np
+import yaml
 import json
+import time
 from datetime import datetime
 
-validation_report = {
-    'timestamp': datetime.now().isoformat(),
-    'best_epoch': trainer.best_epoch,
-    'val_metrics': best_checkpoint['val_metrics'],
-    'test_metrics': test_metrics,
-    'can_deploy': can_deploy,
-    'deploy_criteria': criteria,
-    'critical_cases_count': len(trainer.critical_cases)
+# Imports des modules GitHub
+from src.data.ieee_dataset import prepare_ieee_dataset
+from src.models.gnn_model import LightGNNModel
+from src.models.llm_wrapper import LightLLMWrapper
+from src.models.hybrid_model import LightHybridModel
+from src.utils.metrics import compute_all_metrics
+
+import torch.nn as nn
+import torch.optim as optim
+
+print("✅ Tous les modules importés\n")
+
+# ============================================
+# ⚙️ CONFIGURATION
+# ============================================
+
+# PARAMÈTRES À AJUSTER
+CONFIG = {
+    'dataset_percent': 0.25,  # 0.25 = 25% (rapide), 1.0 = 100% (meilleur)
+    'num_epochs': 8,
+    'learning_rate': 1e-3,
+    'batch_size': None,  # None = full graph en mémoire
+    'use_hybrid': False,  # False = GNN seul, True = GNN+LLM
 }
 
-report_path = f"{training_config['logs_dir']}/validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-with open(report_path, 'w') as f:
-    json.dump(validation_report, f, indent=2, default=str)
-
-print(f"\n📄 Rapport de validation sauvegardé: {report_path}")
+print(f"📋 Configuration:")
+print(f"   Dataset: {int(CONFIG['dataset_percent']*100)}%")
+print(f"   Epochs: {CONFIG['num_epochs']}")
+print(f"   LR: {CONFIG['learning_rate']}")
+print(f"   Mode: {'GNN+LLM Hybrid' if CONFIG['use_hybrid'] else 'GNN Seul'}")
+print(f"   Device: {device}")
+print()
 
 # ============================================
-# RÉSUMÉ FINAL
+# 📊 ÉTAPE 1: CHARGEMENT DATASET
 # ============================================
 
-print("\n" + "="*80)
-print("🎉 ENTRAÎNEMENT ET VALIDATION TERMINÉS!")
-print("="*80)
+print("="*60)
+print("📊 ÉTAPE 1/5: CHARGEMENT DATASET")
+print("="*60)
 
+start_time = time.time()
+
+train_trans = pd.read_csv('/kaggle/input/ieee-fraud-detection/train_transaction.csv')
+train_ident = pd.read_csv('/kaggle/input/ieee-fraud-detection/train_identity.csv')
+
+print(f"✅ Dataset original: {len(train_trans):,} transactions")
+
+# Échantillonnage si demandé
+if CONFIG['dataset_percent'] < 1.0:
+    print(f"🔄 Échantillonnage {int(CONFIG['dataset_percent']*100)}%...")
+    train_trans = train_trans.sample(frac=CONFIG['dataset_percent'], random_state=42)
+    train_ident = train_ident[train_ident['TransactionID'].isin(train_trans['TransactionID'])]
+
+print(f"✅ Dataset utilisé: {len(train_trans):,} transactions")
+print(f"   Fraudes: {train_trans['isFraud'].sum():,} ({train_trans['isFraud'].mean()*100:.2f}%)")
+
+# Sauvegarder
+os.makedirs('/kaggle/working/temp_data', exist_ok=True)
+train_trans.to_csv('/kaggle/working/temp_data/train_transaction.csv', index=False)
+train_ident.to_csv('/kaggle/working/temp_data/train_identity.csv', index=False)
+
+elapsed = time.time() - start_time
+print(f"⏱️  Temps: {elapsed:.1f}s\n")
+
+# ============================================
+# 🔗 ÉTAPE 2: CONSTRUCTION GRAPHE GNN
+# ============================================
+
+print("="*60)
+print("🔗 ÉTAPE 2/5: CONSTRUCTION GRAPHE GNN")
+print("="*60)
+print("⏱️  Cela peut prendre 10-45 minutes selon taille dataset...")
+print("💡 Le graphe est construit sur CPU (normal)\n")
+
+start_time = time.time()
+
+dataset = prepare_ieee_dataset(
+    data_dir='/kaggle/working/temp_data',
+    output_dir='/kaggle/working/data/processed',
+    test_size=0.15,
+    val_size=0.15
+)
+
+elapsed = time.time() - start_time
+
+print(f"\n✅ Graphe créé en {elapsed/60:.1f} minutes:")
+print(f"   Train: {dataset['train'].num_nodes:,} nodes, {dataset['train'].num_edges:,} edges")
+print(f"   Val: {dataset['val'].num_nodes:,} nodes, {dataset['val'].num_edges:,} edges")
+print(f"   Test: {dataset['test'].num_nodes:,} nodes, {dataset['test'].num_edges:,} edges")
+print(f"   Features: {dataset['train'].x.shape[1]}")
+
+torch.save(dataset, '/kaggle/working/ieee_graph.pt')
+print(f"💾 Graphe sauvegardé\n")
+
+# ============================================
+# 🧠 ÉTAPE 3: CRÉATION MODÈLES
+# ============================================
+
+print("="*60)
+print("🧠 ÉTAPE 3/5: CRÉATION MODÈLES")
+print("="*60)
+
+# Charger config
+with open('configs/config_light.yaml', 'r') as f:
+    model_config = yaml.safe_load(f)
+
+# Corriger dimensions
+model_config['gnn']['in_channels'] = dataset['train'].x.shape[1]
+
+# Créer GNN
+gnn_model = LightGNNModel(model_config['gnn']).to(device)
+print(f"✅ GNN créé: {sum(p.numel() for p in gnn_model.parameters()):,} params")
+
+# Créer LLM si mode hybrid
+if CONFIG['use_hybrid']:
+    llm_model = LightLLMWrapper(model_config['llm']).to(device)
+    print(f"✅ LLM créé avec LoRA")
+    
+    hybrid_model = LightHybridModel(gnn_model, llm_model).to(device)
+    model = hybrid_model
+    print(f"✅ Hybrid Model: {sum(p.numel() for p in model.parameters()):,} params")
+else:
+    model = gnn_model
+    print("✅ Mode GNN seul")
+
+print(f"   Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+print()
+
+# ============================================
+# 🏋️ ÉTAPE 4: TRAINING
+# ============================================
+
+print("="*60)
+print("🏋️ ÉTAPE 4/5: TRAINING")
+print("="*60)
+print(f"⏱️  Temps estimé: {CONFIG['num_epochs'] * 2}-{CONFIG['num_epochs'] * 5} minutes\n")
+
+# Focal Loss pour déséquilibre
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, inputs, targets):
+        BCE = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE)
+        return (self.alpha * (1-pt)**self.gamma * BCE).mean()
+
+# Setup training
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=CONFIG['learning_rate'],
+    weight_decay=0.01
+)
+
+criterion = FocalLoss(alpha=0.25, gamma=2.0)
+
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='max',
+    factor=0.5,
+    patience=2,
+    verbose=True
+)
+
+# Charger données sur GPU
+print(f"📥 Chargement données sur {device}...")
+train_data = dataset['train'].to(device)
+val_data = dataset['val'].to(device)
+print(f"✅ Données sur GPU\n")
+
+# Training loop
+best_f1 = 0
+training_start = time.time()
+history = {'train_loss': [], 'val_loss': [], 'val_f1': []}
+
+for epoch in range(CONFIG['num_epochs']):
+    epoch_start = time.time()
+    
+    print(f"{'='*60}")
+    print(f"Epoch {epoch+1}/{CONFIG['num_epochs']}")
+    print(f"{'='*60}")
+    
+    # TRAINING
+    model.train()
+    
+    if CONFIG['use_hybrid']:
+        logits = model((train_data.x, train_data.edge_index, None), None)
+    else:
+        logits, _ = model(train_data.x, train_data.edge_index, None)
+    
+    loss = criterion(logits, train_data.y)
+    
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    
+    train_loss = loss.item()
+    
+    # VALIDATION
+    model.eval()
+    with torch.no_grad():
+        if CONFIG['use_hybrid']:
+            val_logits = model((val_data.x, val_data.edge_index, None), None)
+        else:
+            val_logits, _ = model(val_data.x, val_data.edge_index, None)
+        
+        val_loss = criterion(val_logits, val_data.y).item()
+        
+        val_pred = val_logits.argmax(dim=1).cpu().numpy()
+        val_true = val_data.y.cpu().numpy()
+        val_probs = torch.softmax(val_logits, dim=1)[:, 1].cpu().numpy()
+        
+        metrics = compute_all_metrics(val_true, val_pred, val_probs)
+    
+    # Scheduler
+    scheduler.step(metrics['f1_score'])
+    
+    # Historique
+    history['train_loss'].append(train_loss)
+    history['val_loss'].append(val_loss)
+    history['val_f1'].append(metrics['f1_score'])
+    
+    # Affichage
+    epoch_time = time.time() - epoch_start
+    print(f"\n📊 Résultats (temps: {epoch_time:.1f}s):")
+    print(f"   Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+    print(f"   Accuracy:   {metrics['accuracy']:.4f}")
+    print(f"   F1-Score:   {metrics['f1_score']:.4f}")
+    print(f"   Precision:  {metrics['precision']:.4f}")
+    print(f"   Recall:     {metrics['recall']:.4f}")
+    print(f"   ROC-AUC:    {metrics['roc_auc']:.4f}")
+    
+    # Sauvegarder meilleur modèle
+    if metrics['f1_score'] > best_f1:
+        best_f1 = metrics['f1_score']
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'epoch': epoch + 1,
+            'metrics': metrics,
+            'config': CONFIG
+        }, '/kaggle/working/best_model.pt')
+        print(f"\n   🏆 Meilleur modèle sauvegardé (F1: {best_f1:.4f})")
+    
+    print()
+
+training_time = time.time() - training_start
+
+print(f"{'='*60}")
+print(f"✅ Training terminé en {training_time/60:.1f} minutes")
+print(f"🏆 Meilleur F1 validation: {best_f1:.4f}")
+print(f"{'='*60}\n")
+
+# ============================================
+# 🌅 ÉTAPE 5: TEST FINAL
+# ============================================
+
+print("="*60)
+print("🌅 ÉTAPE 5/5: TEST FINAL")
+print("="*60)
+
+# Charger meilleur modèle
+checkpoint = torch.load('/kaggle/working/best_model.pt')
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+
+print(f"✅ Meilleur modèle chargé (Epoch {checkpoint['epoch']})\n")
+
+# Test
+test_data = dataset['test'].to(device)
+
+with torch.no_grad():
+    if CONFIG['use_hybrid']:
+        test_logits = model((test_data.x, test_data.edge_index, None), None)
+    else:
+        test_logits, _ = model(test_data.x, test_data.edge_index, None)
+    
+    test_pred = test_logits.argmax(dim=1).cpu().numpy()
+    test_true = test_data.y.cpu().numpy()
+    test_probs = torch.softmax(test_logits, dim=1)[:, 1].cpu().numpy()
+    
+    test_metrics = compute_all_metrics(test_true, test_pred, test_probs)
+
+# Affichage résultats
+print(f"📊 RÉSULTATS FINAUX:")
+print(f"{'='*60}")
+print(f"  Accuracy:   {test_metrics['accuracy']:.4f}")
+print(f"  Precision:  {test_metrics['precision']:.4f}")
+print(f"  Recall:     {test_metrics['recall']:.4f}")
+print(f"  F1-Score:   {test_metrics['f1_score']:.4f}")
+print(f"  ROC-AUC:    {test_metrics['roc_auc']:.4f}")
+print(f"{'='*60}")
+
+# Confusion Matrix
+if 'true_positives' in test_metrics:
+    print(f"\n📈 Confusion Matrix:")
+    print(f"   True Positives:  {test_metrics['true_positives']:,}")
+    print(f"   False Positives: {test_metrics['false_positives']:,}")
+    print(f"   True Negatives:  {test_metrics['true_negatives']:,}")
+    print(f"   False Negatives: {test_metrics['false_negatives']:,}")
+    print(f"   FPR: {test_metrics['fpr']:.4f}")
+    print(f"   FNR: {test_metrics['fnr']:.4f}")
+
+# Critères de déploiement
+deployable = (
+    test_metrics['f1_score'] >= 0.70 and
+    test_metrics['precision'] >= 0.65 and
+    test_metrics['recall'] >= 0.65
+)
+
+print(f"\n{'='*60}")
+if deployable:
+    print("✅ MODÈLE VALIDÉ POUR DÉPLOIEMENT PRODUCTION!")
+    print("   Tous les critères sont remplis:")
+    print(f"   ✓ F1-Score ≥ 0.70: {test_metrics['f1_score']:.4f}")
+    print(f"   ✓ Precision ≥ 0.65: {test_metrics['precision']:.4f}")
+    print(f"   ✓ Recall ≥ 0.65: {test_metrics['recall']:.4f}")
+else:
+    print("⚠️  MODÈLE À AMÉLIORER")
+    print("   Suggestions:")
+    if test_metrics['f1_score'] < 0.70:
+        print("   • Augmenter nombre d'epochs")
+    if CONFIG['dataset_percent'] < 1.0:
+        print("   • Utiliser dataset complet (100%)")
+    if not CONFIG['use_hybrid']:
+        print("   • Activer mode hybrid (GNN+LLM)")
+    print(f"\n   Résultats actuels:")
+    print(f"   {'✓' if test_metrics['f1_score'] >= 0.70 else '✗'} F1-Score ≥ 0.70: {test_metrics['f1_score']:.4f}")
+    print(f"   {'✓' if test_metrics['precision'] >= 0.65 else '✗'} Precision ≥ 0.65: {test_metrics['precision']:.4f}")
+    print(f"   {'✓' if test_metrics['recall'] >= 0.65 else '✗'} Recall ≥ 0.65: {test_metrics['recall']:.4f}")
+
+print(f"{'='*60}")
+
+# ============================================
+# 💾 SAUVEGARDE RÉSULTATS
+# ============================================
+
+print(f"\n💾 Sauvegarde résultats...")
+
+results = {
+    'timestamp': datetime.now().isoformat(),
+    'config': CONFIG,
+    'dataset': {
+        'total_transactions': len(train_trans),
+        'train_nodes': dataset['train'].num_nodes,
+        'val_nodes': dataset['val'].num_nodes,
+        'test_nodes': dataset['test'].num_nodes,
+        'features': dataset['train'].x.shape[1]
+    },
+    'training': {
+        'epochs': CONFIG['num_epochs'],
+        'best_epoch': checkpoint['epoch'],
+        'training_time_minutes': training_time / 60,
+        'best_val_f1': float(best_f1)
+    },
+    'test_metrics': {k: float(v) if isinstance(v, (int, float, np.number)) else v 
+                     for k, v in test_metrics.items()},
+    'deployable': deployable,
+    'device': str(device),
+    'gpu_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+}
+
+with open('/kaggle/working/results.json', 'w') as f:
+    json.dump(results, f, indent=2)
+
+print(f"✅ Résultats sauvegardés: /kaggle/working/results.json")
+
+# ============================================
+# 🎉 RÉSUMÉ FINAL
+# ============================================
+
+print(f"\n{'='*60}")
+print("🎉 PIPELINE TERMINÉ AVEC SUCCÈS!")
+print(f"{'='*60}")
+print(f"\n📊 Résumé:")
+print(f"   Dataset: {len(train_trans):,} transactions ({int(CONFIG['dataset_percent']*100)}%)")
+print(f"   Training: {training_time/60:.1f} minutes")
+print(f"   Meilleur F1 Val: {best_f1:.4f}")
+print(f"   F1-Score Test: {test_metrics['f1_score']:.4f}")
+print(f"   Déploiement: {'✅ OUI' if deployable else '⚠️ NON'}")
 print(f"\n📁 Fichiers générés:")
-print(f"   Checkpoints: {training_config['checkpoint_dir']}")
-print(f"   Logs: {training_config['logs_dir']}")
-print(f"   Visualisation: {training_config['logs_dir']}/training_results.png")
-
-print(f"\n🏆 Résultats finaux:")
-print(f"   Meilleur epoch: {trainer.best_epoch}")
-print(f"   Val Loss: {trainer.best_val_loss:.4f}")
-print(f"   Val F1: {trainer.best_val_f1:.4f}")
-print(f"   Test F1: {test_metrics['f1']:.4f}")
-print(f"   Déploiement: {'✅ OUI' if can_deploy else '⚠️ NON'}")
-
-print("\n✨ Merci d'avoir utilisé le système de détection de fraude GNN+LLM!")
+print(f"   • /kaggle/working/best_model.pt")
+print(f"   • /kaggle/working/results.json")
+print(f"   • /kaggle/working/ieee_graph.pt")
+print(f"\n✨ Merci d'avoir utilisé le système de détection de fraude!")
+print(f"{'='*60}\n")
