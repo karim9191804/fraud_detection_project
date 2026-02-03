@@ -734,55 +734,106 @@ print(f"   ✅ Validation automatique + manuelle")
 print(f"   ✅ Déploiement sécurisé avec rollback")
 print(f"\n🏆 Ce système représente l'état de l'art en production ML!")
 print(f"{'='*80}\n")
-```
 
----
+# ═══════════════════════════════════════════════════════════
+# CELLULE 18: Système d'Explication Avancé
+# ═══════════════════════════════════════════════════════════
 
-## 📝 Instructions d'Utilisation
+print("\n" + "="*80)
+print("🔍 SYSTÈME D'EXPLICATION INTELLIGIBLE")
+print("="*80)
 
-### **1. Créer un nouveau notebook Kaggle**
+import shap
 
-1. Allez sur [kaggle.com](https://www.kaggle.com)
-2. Cliquez sur "New Notebook"
-3. Ajoutez le dataset "IEEE-CIS Fraud Detection"
-4. Activez GPU (Settings → Accelerator → GPU T4)
+# 1. SHAP pour feature importance
+explainer = shap.GradientExplainer(model, train_data.x[:100].to(device))
 
-### **2. Copier le script**
+# Expliquer une transaction frauduleuse
+fraud_idx = test_pred.nonzero()[0]
+sample_tx = test_data.x[fraud_idx].unsqueeze(0).to(device)
 
-Collez tout le script ci-dessus dans **UNE SEULE CELLULE** du notebook
+shap_values = explainer.shap_values(sample_tx)
 
-### **3. Lancer**
+# Top 10 features
+feature_importance = np.abs(shap_values[0]).argsort()[-10:][::-1]
 
-Cliquez sur "Run All" et attendez ~2-3 heures
+print(f"\n📊 EXPLICATION TRANSACTION #{fraud_idx}:")
+print(f"   Prédiction: FRAUDE ({test_probs[fraud_idx]:.2%})")
+print(f"\n   Top 10 raisons:")
+for i, feat_idx in enumerate(feature_importance):
+    impact = shap_values[0][feat_idx]
+    print(f"   {i+1}. Feature {feat_idx}: Impact = {impact:+.4f}")
 
----
+# 2. Attention visualization
+if CONFIG['use_hybrid']:
+    attention_weights = model.gnn.get_attention_weights()
+    print(f"\n   Voisins influents:")
+    top_neighbors = attention_weights[fraud_idx].argsort()[-5:][::-1]
+    for neighbor in top_neighbors:
+        print(f"   • TX {neighbor}: Attention = {attention_weights[fraud_idx][neighbor]:.4f}")
 
-## ⏱️ Timeline d'Exécution
+# 3. LLM explanation génération
+if CONFIG['use_hybrid']:
+    prompt = f"""
+    Cette transaction est classée FRAUDE avec {test_probs[fraud_idx]:.0%} de confiance.
+    Explique pourquoi en 2-3 phrases simples pour un analyste humain.
+    """
+    # Note: Nécessite tokenizer pour génération
+    print(f"\n💬 Explication LLM:")
+    print(f"   [Placeholder: Feature engineering + prompt-based explanation]")
 
-| Phase | Durée | Description |
-|-------|-------|-------------|
-| Setup | 2 min | Clone + install |
-| Load data | 1 min | 590K transactions |
-| Build graph | 70 min | k-NN construction |
-| Training | 60-90 min | 50 epochs GPU |
-| Test | 2 min | Évaluation finale |
-| **Production demo** | **5 min** | **Streaming + Fine-tuning + RLHF** |
-| **TOTAL** | **~2-3h** | |
+print("\n✅ Système d'explication opérationnel")
 
----
+# ═══════════════════════════════════════════════════════════
+# CELLULE 19: Dashboard Visualisation
+# ═══════════════════════════════════════════════════════════
 
-## 🎯 Résultats Attendus
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-### **Phase Offline (Cellules 1-12) :**
-```
-F1-Score Test: 0.70-0.78
-Precision: 0.68-0.76
-Recall: 0.72-0.82
-✅ MODÈLE VALIDÉ POUR DÉPLOIEMENT
-```
+print("\n" + "="*80)
+print("📈 DASHBOARD VISUALISATION")
+print("="*80)
 
-### **Phase Production (Cellule 13) :**
-```
-☀️ JOUR: 100 TX, 8 fraudes, 12 cas critiques, 15ms latence
-🌙 NUIT: 12 feedbacks, Fine-tuning +0.03 F1, RLHF reward +0.78
-🌅 MATIN: Validation OK, Recommandation: DÉPLOYER ✅
+# 1. Training curves
+fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+# Loss curves
+axes[0, 0].plot(history['train_loss'], label='Train')
+axes[0, 0].plot(history['val_loss'], label='Val')
+axes[0, 0].set_title('Loss Evolution')
+axes[0, 0].legend()
+
+# F1 curve
+axes[0, 1].plot(history['val_f1'])
+axes[0, 1].set_title('Validation F1-Score')
+
+# Learning Rate
+axes[1, 0].plot(history['lr'])
+axes[1, 0].set_title('Learning Rate Schedule')
+
+# Confusion Matrix
+from sklearn.metrics import confusion_matrix
+cm = confusion_matrix(test_true, test_pred)
+sns.heatmap(cm, annot=True, fmt='d', ax=axes[1, 1])
+axes[1, 1].set_title('Confusion Matrix')
+
+plt.tight_layout()
+plt.savefig('/kaggle/working/training_dashboard.png', dpi=150)
+print("✅ Dashboard sauvegardé: training_dashboard.png")
+
+# 2. ROC Curve
+from sklearn.metrics import roc_curve, auc
+
+fpr, tpr, _ = roc_curve(test_true, test_probs)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, label=f'ROC (AUC = {roc_auc:.4f})')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.legend()
+plt.savefig('/kaggle/working/roc_curve.png', dpi=150)
+print("✅ ROC Curve sauvegardée")
