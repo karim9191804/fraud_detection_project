@@ -1,6 +1,6 @@
 """
 GNN Model - Version Légère pour Training Rapide
-Optimisé pour dataset 25% avec GPU P100
+Optimisé pour dataset avec GPU P100
 """
 
 import torch
@@ -13,18 +13,19 @@ class LightGNNModel(nn.Module):
     """
     GNN Léger avec GAT
     - 2 couches seulement
-    - 64 hidden channels (au lieu de 256+)
+    - 64 hidden channels
     - Dropout 0.3
     """
     
     def __init__(self, config):
         super().__init__()
         
-        self.in_channels = config.get('in_channels', 432)
-        self.hidden_channels = config.get('hidden_channels', 64)  # LÉGER !
-        self.num_layers = config.get('num_layers', 2)  # 2 couches max
+        # ✅ CORRIGÉ: Pas de default, prend direct du config
+        self.in_channels = config['in_channels']
+        self.hidden_channels = config.get('hidden_channels', 64)
+        self.num_layers = config.get('num_layers', 2)
         self.dropout = config.get('dropout', 0.3)
-        self.heads = config.get('heads', 2)  # 2 attention heads
+        self.heads = config.get('heads', 2)
         
         # Couche d'entrée
         self.conv1 = GATConv(
@@ -54,7 +55,7 @@ class LightGNNModel(nn.Module):
         )
     
     def forward(self, x, edge_index, batch=None):
-        """Forward pass léger"""
+        """Forward pass"""
         
         # Layer 1
         x = self.conv1(x, edge_index)
@@ -81,25 +82,3 @@ class LightGNNModel(nn.Module):
         with torch.no_grad():
             _, embeddings = self.forward(x, edge_index, batch)
         return embeddings
-
-
-def create_light_gnn(num_features=432):
-    """
-    Créer GNN léger pour training rapide
-    
-    ~100K paramètres (vs 1M+ pour version complète)
-    """
-    config = {
-        'in_channels': num_features,
-        'hidden_channels': 64,  # Réduit de 256
-        'num_layers': 2,  # Réduit de 3-4
-        'dropout': 0.3,
-        'heads': 2  # Réduit de 4-8
-    }
-    
-    model = LightGNNModel(config)
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"✅ GNN Léger créé: {total_params:,} paramètres")
-    
-    return model
